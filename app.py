@@ -11,7 +11,12 @@ from llm_interface import LLMInterface
 import json
 
 # ── API key ────────────────────────────────────────────────────────────────────
-GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
+# Try Groq key from secrets; fall back to env var for local dev
+try:
+    GOOGLE_API_KEY = st.secrets["GROQ_API_KEY"]
+except Exception:
+    import os
+    GOOGLE_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -37,61 +42,25 @@ if "chat_locked" not in st.session_state:
 # ── LLM init ───────────────────────────────────────────────────────────────────
 def initialize_llm():
     try:
-        st.session_state.llm = LLMInterface(api_key=GOOGLE_API_KEY)
+        import os as _os
+        _app_dir  = _os.path.dirname(_os.path.abspath(__file__))
+        _bls_path = _os.path.join(_app_dir, "bls_ooh_chunks.jsonl")
+        st.session_state.llm = LLMInterface(api_key=GOOGLE_API_KEY, bls_path=_bls_path)
         return True
     except Exception as e:
         st.session_state.llm_error = str(e)
         return False
 
 
-# ── Bug 1 fix: conversation-complete detection ─────────────────────────────────
+# ── Conversation-complete: ONLY when chat_locked ───────────────────────────────
 def is_conversation_complete() -> bool:
-    """Check if the system has gathered enough info to show the council."""
-    if len(st.session_state.messages) < 4:
-        return False
-
-    state_dict = st.session_state.state.to_dict()
-    decision_type = state_dict.get("decision_metadata", {}).get("decision_type")
-
-    # Primary signal: last assistant message contains a conclusion phrase
-    if st.session_state.messages:
-        last_msg = st.session_state.messages[-1]
-        if last_msg["role"] == "assistant":
-            content = last_msg["content"]
-            conclusion_phrases = [
-                "Council of Experts",
-                "council of experts",
-                "Council of Expert",
-                "See Council",
-                "'Council of Experts' button",
-            ]
-            if any(phrase in content for phrase in conclusion_phrases):
-                return True
-
-    # Fallback: enough facts collected for the decision type
-    if decision_type in ("career_choice", "education"):
-        relevant_count = sum(
-            1 for cat in [
-                state_dict.get("interests", {}),
-                state_dict.get("career_vision", {}),
-                state_dict.get("values", {}),
-            ]
-            for v in cat.values()
-            if v is not None and v is not False and v != ""
-        )
-        return relevant_count >= 4
-    else:
-        relevant_count = sum(
-            1 for cat in [
-                state_dict.get("financial", {}),
-                state_dict.get("values", {}),
-                state_dict.get("current", {}),
-                state_dict.get("opportunity", {}),
-            ]
-            for v in cat.values()
-            if v is not None
-        )
-        return relevant_count >= 12
+    """
+    Council button shows only when chat_locked=True.
+    chat_locked is set in process_message() when the LLM sends
+    a conclusion containing "Council of Experts".
+    Removed field-count fallback — it was showing the button too early.
+    """
+    return st.session_state.get("chat_locked", False)
 
 
 # ── Header ─────────────────────────────────────────────────────────────────────
@@ -391,249 +360,537 @@ _FACT_REGISTRY = {
 # Values that should never appear in the tree — placeholders, not real answers
 _PLACEHOLDER_VALUES = {"neutral", "unknown", "undecided", "n/a", "none", "", "null"}
 
+def _paired_university_factors(state_dict, opt_a, opt_b, college_retriever=None):
+    """
+    For university comparisons: compare uni_a vs uni_b field-by-field.
+    Returns list of factor dicts with real comparative directions.
+    Also fetches College Scorecard data if retriever available.
+    """
+    uni_a = state_dict.get("uni_a", {})
+    uni_b = state_dict.get("uni_b", {})
+    personal = state_dict.get("personal", {})
+    values   = state_dict.get("values", {})
+    interests = state_dict.get("interests", {})
+    career_vis = state_dict.get("career_vision", {})
+
+    factors = []
+
+    def add(name, val_a, val_b, interpret_fn, category="Comparison", source=None):
+        """Add a comparative factor. interpret_fn(val_a, val_b) -> (direction, label)."""
+        if val_a is None and val_b is None:
+            return
+        direction, label = interpret_fn(val_a, val_b)
+        factors.append({
+            "category":  category,
+            "name":      name,
+            "value":     f"{opt_a}: {val_a or '?'}  |  {opt_b}: {val_b or '?'}",
+            "impact":    label,
+            "direction": direction,
+            "source":    source,   # "api", "bls", or None (user-provided)
+        })
+
+    def add_single(name, val, direction, label, category="User Input", source=None):
+        if val in (None, False, "", []):
+            return
+        if isinstance(val, bool) and not val:
+            return
+        factors.append({
+            "category":  category,
+            "name":      name,
+            "value":     str(val),
+            "impact":    label,
+            "direction": direction,
+            "source":    source,
+        })
+
+    # ── Paired comparisons from user-provided data ────────────────────────────
+
+    # Tuition comparison
+    ta = uni_a.get("tuition")
+    tb = uni_b.get("tuition")
+    if ta and tb:
+        def cmp_tuition(a, b):
+            try:
+                a, b = float(a), float(b)
+                diff = abs(a - b)
+                cheaper = opt_a if a < b else opt_b
+                direction = "a" if a < b else "b"
+                return direction, f"{cheaper} is ${diff:,.0f}/yr cheaper"
+            except:
+                return "neutral", f"Tuition: {opt_a} ${a} | {opt_b} ${b}"
+        add("Tuition (annual)", ta, tb, cmp_tuition, "Cost", source=None)
+    elif ta:
+        add_single(f"{opt_a} Tuition", f"${ta:,}/yr" if isinstance(ta, (int,float)) else ta,
+                   "neutral", "Only one tuition known", "Cost")
+    elif tb:
+        add_single(f"{opt_b} Tuition", f"${tb:,}/yr" if isinstance(tb, (int,float)) else tb,
+                   "neutral", "Only one tuition known", "Cost")
+
+    # Scholarship
+    sa = uni_a.get("scholarship")
+    sb = uni_b.get("scholarship")
+    if sa and sa.lower() not in ("none", "no", "unknown"):
+        add_single(f"{opt_a} — Scholarship", sa, "a", f"Financial support at {opt_a}", "Cost")
+    if sb and sb.lower() not in ("none", "no", "unknown"):
+        add_single(f"{opt_b} — Scholarship", sb, "b", f"Financial support at {opt_b}", "Cost")
+
+    # Ranking / reputation
+    ra = uni_a.get("ranking")
+    rb = uni_b.get("ranking")
+    rep_imp = values.get("reputation_importance", 0)
+    try: rep_imp = float(rep_imp)
+    except: rep_imp = 0
+    if ra and rb:
+        def cmp_rank(a, b):
+            strong = ["top", "well known", "strong", "reputable", "better", "higher"]
+            a_str = any(w in str(a).lower() for w in strong)
+            b_str = any(w in str(b).lower() for w in strong)
+            if a_str and not b_str: return "a", f"{opt_a} has stronger reputation"
+            if b_str and not a_str: return "b", f"{opt_b} has stronger reputation"
+            return "neutral", "Reputation roughly comparable"
+        add("Program Reputation", ra, rb, cmp_rank, "Academic")
+    elif ra:
+        label = "Strong reputation" if any(w in str(ra).lower() for w in ["top","well known","strong"]) else f"Reputation: {ra}"
+        direction = "a" if rep_imp >= 7 else "neutral"
+        add_single(f"{opt_a} — Reputation", ra, direction, label, "Academic")
+    elif rb:
+        label = "Strong reputation" if any(w in str(rb).lower() for w in ["top","well known","strong"]) else f"Reputation: {rb}"
+        direction = "b" if rep_imp >= 7 else "neutral"
+        add_single(f"{opt_b} — Reputation", rb, direction, label, "Academic")
+
+    # Location preference
+    city_pref = personal.get("city_preference", "")
+    la = uni_a.get("location", "")
+    lb = uni_b.get("location", "")
+    if city_pref and (la or lb):
+        big_cities = ["corpus christi", "houston", "dallas", "austin", "san antonio",
+                      "los angeles", "new york", "chicago", "boston", "seattle", "miami"]
+        a_big = any(c in str(la).lower() for c in big_cities)
+        b_big = any(c in str(lb).lower() for c in big_cities)
+        if "big" in city_pref.lower():
+            if a_big and not b_big: add_single("City Preference", f"Prefers big city ({la})", "a", f"{opt_a} is in a larger city — matches preference", "Personal")
+            elif b_big and not a_big: add_single("City Preference", f"Prefers big city ({lb})", "b", f"{opt_b} is in a larger city — matches preference", "Personal")
+            else: add_single("City Preference", city_pref, "neutral", "Both in comparable city sizes", "Personal")
+        elif "small" in city_pref.lower() or "town" in city_pref.lower():
+            if b_big and not a_big: add_single("City Preference", f"Prefers smaller town ({lb})", "b", f"{opt_b} is in a smaller town — matches preference", "Personal")
+            else: add_single("City Preference", city_pref, "neutral", "Campus environment preference noted", "Personal")
+        else:
+            add_single("City Preference", city_pref, "neutral", "Campus environment preference noted", "Personal")
+
+    # Social connection
+    social = personal.get("social_connection", "")
+    if social:
+        direction = "b" if opt_b.lower() in social.lower() else ("a" if opt_a.lower() in social.lower() else "neutral")
+        add_single("Social Connection", social, direction, f"Social support near {opt_b if direction=='b' else opt_a}", "Personal")
+
+    # Field of interest
+    field = interests.get("field_of_interest", "")
+    if field:
+        add_single("Field of Interest", field, "neutral", f"Both programs may offer {field} tracks", "Academic")
+
+    # Career goal
+    goal = career_vis.get("post_graduation_goal", "")
+    if goal == "job":
+        add_single("Career Goal", "Industry job", "neutral", "Both paths lead to industry — placement data matters", "Career")
+    elif goal:
+        add_single("Career Goal", goal, "neutral", f"Targeting: {goal}", "Career")
+
+    desired = career_vis.get("desired_role_5yr", "")
+    if desired:
+        add_single("Target Role", desired, "neutral", f"Aiming for: {desired}", "Career")
+
+    # Reputation importance
+    if rep_imp >= 7:
+        add_single("Reputation Priority", f"{rep_imp}/10", "neutral",
+                   f"High priority ({rep_imp}/10) — program name matters for hiring", "Values")
+
+    # Taking student debt
+    if state_dict.get("financial", {}).get("taking_student_debt"):
+        add_single("Financing", "Student loan", "neutral",
+                   "Taking debt — net cost and post-grad earnings matter most", "Cost")
+
+    return factors
+
+
+def _api_university_factors(card_a, card_b, opt_a, opt_b):
+    """
+    Generate comparative factors from College Scorecard data.
+    These are clearly marked as external data (source='api').
+    """
+    factors = []
+    if card_a is None and card_b is None:
+        return factors
+
+    def add_cmp(name, val_a, val_b, fmt_fn, direction_fn):
+        if val_a is None and val_b is None:
+            return
+        va = fmt_fn(val_a) if val_a else "no data"
+        vb = fmt_fn(val_b) if val_b else "no data"
+        direction = direction_fn(val_a, val_b)
+        if val_a and val_b:
+            diff = abs(val_a - val_b)
+            higher = opt_a if val_a > val_b else opt_b
+            lower  = opt_b if val_a > val_b else opt_a
+        else:
+            higher = lower = None
+        factors.append({
+            "category":  "College Scorecard Data",
+            "name":      name,
+            "value":     f"{opt_a}: {va}  |  {opt_b}: {vb}",
+            "impact":    direction_fn(val_a, val_b, as_label=True),
+            "direction": direction_fn(val_a, val_b),
+            "source":    "api",
+        })
+
+    ta = card_a.tuition_in_state  if card_a else None
+    tb = card_b.tuition_in_state  if card_b else None
+    if ta or tb:
+        va = f"${ta:,}/yr" if ta else "no data"
+        vb = f"${tb:,}/yr" if tb else "no data"
+        if ta and tb:
+            cheaper = opt_a if ta < tb else opt_b
+            direction = "a" if ta < tb else "b"
+            label = f"{cheaper} is ${abs(ta-tb):,}/yr cheaper in-state"
+        elif ta:
+            direction, label = "neutral", f"{opt_a}: ${ta:,}/yr"
+        else:
+            direction, label = "neutral", f"{opt_b}: ${tb:,}/yr"
+        factors.append({"category": "College Scorecard Data", "name": "In-State Tuition",
+                        "value": f"{opt_a}: {va}  |  {opt_b}: {vb}",
+                        "impact": label, "direction": direction, "source": "api"})
+
+    ea = card_a.median_earnings_10yr if card_a else None
+    eb = card_b.median_earnings_10yr if card_b else None
+    if ea or eb:
+        va = f"${ea:,}" if ea else "no data"
+        vb = f"${eb:,}" if eb else "no data"
+        if ea and eb:
+            higher = opt_a if ea > eb else opt_b
+            direction = "a" if ea > eb else "b"
+            label = f"{higher} grads earn ${abs(ea-eb):,} more at 10 years"
+        elif ea:
+            direction, label = "neutral", f"{opt_a} median: ${ea:,}"
+        else:
+            direction, label = "neutral", f"{opt_b} median: ${eb:,}"
+        factors.append({"category": "College Scorecard Data", "name": "Median Earnings (10yr)",
+                        "value": f"{opt_a}: {va}  |  {opt_b}: {vb}",
+                        "impact": label, "direction": direction, "source": "api"})
+
+    ga = card_a.grad_rate if card_a else None
+    gb = card_b.grad_rate if card_b else None
+    if ga or gb:
+        va = f"{ga*100:.0f}%" if ga else "no data"
+        vb = f"{gb*100:.0f}%" if gb else "no data"
+        if ga and gb:
+            higher = opt_a if ga > gb else opt_b
+            direction = "a" if ga > gb else "b"
+            label = f"{higher} has higher graduation rate ({max(ga,gb)*100:.0f}%)"
+        else:
+            direction, label = "neutral", "Grad rate data partial"
+        factors.append({"category": "College Scorecard Data", "name": "Graduation Rate (6yr)",
+                        "value": f"{opt_a}: {va}  |  {opt_b}: {vb}",
+                        "impact": label, "direction": direction, "source": "api"})
+
+    return factors
+
+
 def render_decision_tree(state_dict: dict, council_results: dict):
     """
-    Renders a visual decision tree using the symbolic state facts.
-    Fully dynamic — builds fact cards from whatever is actually in state_dict.
-    Uses a master registry to assign each field to the right agent.
+    Decision factor tree — comparative analysis.
+    For university comparisons: does paired field-by-field comparison.
+    External data (College Scorecard / BLS) highlighted distinctly.
     """
-    options   = state_dict.get("decision_metadata", {}).get("options_being_compared", ["Option A", "Option B"])
-    option_a  = options[0] if len(options) > 0 else "Option A"
-    option_b  = options[1] if len(options) > 1 else "Option B"
-    avg_vote  = council_results.get("avg_vote", {})
-    avg_a     = avg_vote.get("option_a", 50)
-    avg_b     = avg_vote.get("option_b", 50)
+    options  = state_dict.get("decision_metadata", {}).get("options_being_compared", ["A", "B"])
+    subtype  = state_dict.get("decision_metadata", {}).get("decision_subtype", "general")
+    opt_a    = options[0] if len(options) > 0 else "Option A"
+    opt_b    = options[1] if len(options) > 1 else "Option B"
+    avg_vote = council_results.get("avg_vote", {})
+    avg_a    = avg_vote.get("option_a", 50)
+    avg_b    = avg_vote.get("option_b", 50)
+    winner   = opt_a if avg_a >= avg_b else opt_b
+    win_pct  = max(avg_a, avg_b)
+    win_color = "#16a34a" if avg_a >= avg_b else "#dc2626"
+    agents   = council_results.get("agents", [])
     agent_votes = council_results.get("agent_votes", {})
 
-    def fmt(v):
-        """Format a raw value for display. Returns None if it's empty/placeholder."""
-        if v is None:                        return None
-        if isinstance(v, bool):              return "Yes" if v else "No"
-        s = str(v).strip()
-        if s == "":                          return None
-        if s.lower() in _PLACEHOLDER_VALUES: return None
-        # Convert float like 8.0 → "8"
+    # ── Build factor list ─────────────────────────────────────────────────────
+    bls_factors = []  # populated in major_choice branch; must exist for all branches
+    if subtype == "university_comparison":
+        # Paired comparative analysis
+        factors = _paired_university_factors(state_dict, opt_a, opt_b)
+
+        # Try to get College Scorecard data for the tree
         try:
-            f = float(s)
-            if f == int(f): return str(int(f))
-        except: pass
-        return s
+            college = st.session_state.llm._college if st.session_state.llm else None
+            if college:
+                cards = college.get_cards_for_decision(opt_a, opt_b)
+                ca, cb = cards.get("option_a"), cards.get("option_b")
+                if ca or cb:
+                    api_factors = _api_university_factors(ca, cb, opt_a, opt_b)
+                    if api_factors:
+                        factors = api_factors + factors
+                        print(f"[TREE] Injected {len(api_factors)} scorecard factors")
+                    else:
+                        print(f"[TREE] Scorecard cards found but no comparable fields")
+                else:
+                    print(f"[TREE] Scorecard: no match for '{opt_a}' or '{opt_b}'")
+            else:
+                print("[TREE] College retriever not initialised")
+        except Exception as e:
+            print(f"[TREE] College Scorecard error: {type(e).__name__}: {e}")
 
-    # ── Build agent_facts dynamically from state_dict + registry ──────────────
-    # agent_id → list of fact dicts
-    agent_facts = {"financial": [], "growth": [], "wellbeing": [], "values_agent": []}
+    else:
+        # Generic factor list for non-university decisions
+        SKIP_VALS   = (None, False, "", [], "none", "null", "unknown", "n/a")
+        SKIP_FIELDS = {"financial_runway_months","salary_raw","tuition_raw",
+                       "work_life_balance_known","team_culture_known","job_market_concern"}
+        READABLE = {
+            "financial_security":    "Financial Security Priority",
+            "career_growth":         "Career Growth Priority",
+            "work_life_balance":     "Work-Life Balance Priority",
+            "has_dependents":        "Has Dependents",
+            "has_family":            "Has Family",
+            "can_relocate":          "Can Relocate",
+            "partner_employed":      "Partner Employed",
+            "requires_relocation":   "Requires Relocation",
+            "current_satisfaction":  "Current Satisfaction",
+            "post_graduation_goal":  "Post-Graduation Goal",
+            "desired_role_5yr":      "Desired Role (5yr)",
+            "research_vs_applied":   "Research vs Applied",
+            "hands_on_work":         "Prefers Hands-On Work",
+            "concern":               "Main Concern",
+            "financial_concern":     "Financial Concern",
+            "leaning":               "Stated Lean",
+            "financial_runway":      "Financial Runway",
+            "current_salary":        "Current Salary",
+            "current_income":        "Current Income",
+            "current_savings":       "Savings / Runway",
+            "debt_total":            "Total Debt",
+            "leave_reason":          "Reason for Leaving",
+            "business_validated":    "Business Tested",
+            "business_idea":         "Business Idea",
+            "current_satisfaction":  "Job Satisfaction",
+            "city_preference":       "City Preference",
+            "social_connection":     "Social Connection",
+            "field_of_interest":     "Field of Interest",
+            "reputation_importance": "Reputation Priority",
+            "taking_student_debt":   "Taking Student Debt",
+            "work_anywhere":         "Open to Work Anywhere",
+        }
+        CAT_LABELS = {
+            "values":"Values & Priorities","interests":"Interests & Work Style",
+            "career_vision":"Career Vision","current":"Current Situation",
+            "personal":"Personal Context","financial":"Financial",
+            "offer_a": opt_a,"offer_b": opt_b,
+        }
 
-    # Deduplicate: track (agent, label) pairs we've already added
-    seen = set()
+        # Import impact_label inline (avoid circular ref)
+        from app import render_decision_tree  # self-ref hack not needed — define inline
 
-    # Iterate over every category and field in state_dict
-    skip_categories = {"decision_metadata", "violations", "missing_info", "decision_mode", "history"}
-    for category, cat_data in state_dict.items():
-        if category in skip_categories:         continue
-        if not isinstance(cat_data, dict):      continue
-        for field, raw_value in cat_data.items():
-            display_val = fmt(raw_value)
-            if display_val is None:             continue  # nothing to show
-            key = (category, field)
-            if key not in _FACT_REGISTRY:       continue  # field not mapped
-            agent_id, label, note, impact_fn = _FACT_REGISTRY[key]
-            dedup_key = (agent_id, label)
-            if dedup_key in seen:               continue  # already added
-            seen.add(dedup_key)
-            impact = impact_fn(raw_value)
-            agent_facts[agent_id].append({
-                "label": label,
-                "value": display_val,
-                "note":  note,
-                "impact": impact,
-            })
+        def _impact(field, val, subtype_):
+            val_str = str(val).lower()
+            if field == "enjoys_coding" and val in (True, "True", "true", "yes"):
+                return ("a","Enjoys coding -- favors CS path")
+            if field == "enjoys_building_systems" and val in (True, "True", "true", "yes"):
+                return ("a","Enjoys building systems -- favors CS")
+            if field == "enjoys_analysis" and val in (True, "True", "true", "yes"):
+                return ("b","Enjoys data analysis -- favors DS")
+            if field == "financial_security" and isinstance(val,(int,float)):
+                if int(val) >= 8:
+                    return ("a", f"{val}/10 salary priority -- favors higher-paying path")
+                elif int(val) >= 5:
+                    return ("neutral", f"Financial security: {val}/10")
+                else:
+                    return ("b", f"{val}/10 -- low priority, more flexibility for risk")
+            if field == "career_growth" and isinstance(val,(int,float)):
+                return ("a", f"Career growth: {val}/10") if int(val)>=7 else ("neutral",f"Career growth: {val}/10")
+            if field == "current_satisfaction" and isinstance(val,(int,float)):
+                if int(val) >= 7: return ("a",f"Satisfied ({val}/10)")
+                if int(val) <= 4: return ("b",f"Dissatisfied ({val}/10)")
+                return ("neutral",f"Satisfaction: {val}/10")
+            if field == "concern":
+                if any(w in val_str for w in ["jobless","income","money","debt","stability"]): return ("a",f"Fear: {val}")
+                if any(w in val_str for w in ["regret","miss","stuck","hate"]): return ("b",f"Fear: {val}")
+                return ("neutral",f"Concern: {val}")
+            if field in ("has_dependents","has_family") and val is True: return ("a","Has dependents -- stability matters")
+            if field == "partner_employed" and val is True: return ("b","Partner employed -- shared safety net")
+            if field in ("current_income","current_salary") and isinstance(val,(int,float)):
+                return ("a",f"${val:,.0f}/yr -- high opportunity cost") if val>=80000 else ("neutral",f"${val:,.0f}/yr")
+            if field in ("financial_runway","current_savings") and isinstance(val,(int,float)):
+                return ("b",f"${val:,.0f} runway") if val>=100000 else ("neutral",f"${val:,.0f} runway")
+            if field == "leaning": return ("b",f"Leans: {val}")
+            if field == "desired_role_5yr":
+                # For CS vs DS: engineering/dev/lead roles favor CS; analyst/scientist favor DS
+                cs_roles = ["software","engineer","developer","lead","manager","architect","devops","sre","backend","frontend","fullstack"]
+                ds_roles  = ["data scientist","analyst","ml engineer","machine learning","research scientist","statistician"]
+                if any(r in val_str for r in cs_roles): return ("a", f"Target role '{val}' aligns with CS path")
+                if any(r in val_str for r in ds_roles):  return ("b", f"Target role '{val}' aligns with DS path")
+                return ("neutral", f"Target role: {val}")
+            if field == "post_graduation_goal":
+                return ("a","Targeting industry job -- CS has broader openings") if "job" in val_str else ("neutral",str(val))
+            if field == "hands_on_work" and val is True: return ("a","Prefers hands-on building -- favors CS")
+            if field == "research" and val is True: return ("b","Research-oriented -- favors DS/ML path")
+            return ("neutral",str(val)[:45])
 
-    # Rename values_agent → values for rendering
-    agent_facts["values"] = agent_facts.pop("values_agent", [])
+        seen = set()
+        factors = []
+        for cat, cat_label in CAT_LABELS.items():
+            cat_data = state_dict.get(cat, {})
+            if not isinstance(cat_data, dict): continue
+            for field, val in cat_data.items():
+                if field in SKIP_FIELDS or val in (None, False, "", []): continue
+                if isinstance(val, bool) and not val: continue
+                dk = (field, str(val).lower().strip())
+                if dk in seen: continue
+                seen.add(dk)
+                display_name = READABLE.get(field, field.replace("_"," ").title())
+                if isinstance(val, float): val = round(val, 1)
+                elif isinstance(val, list): val = ", ".join(str(x) for x in val)
+                direction, impact = _impact(field, str(val), subtype)
+                factors.append({"category":cat_label,"name":display_name,
+                                 "value":str(val),"impact":impact,
+                                 "direction":direction,"source":None})
 
-    # ── Agent metadata ─────────────────────────────────────────────────────────
-    AGENTS = [
-        {"id": "financial", "name": "💰 Financial Security", "border": "#22c55e", "text": "#16a34a", "bg": "#f0fdf4"},
-        {"id": "growth",    "name": "📈 Career Growth",      "border": "#3b82f6", "text": "#1d4ed8", "bg": "#eff6ff"},
-        {"id": "wellbeing", "name": "🧠 Mental Wellbeing",   "border": "#a855f7", "text": "#7e22ce", "bg": "#faf5ff"},
-        {"id": "values",    "name": "🎯 Values Alignment",   "border": "#f97316", "text": "#c2410c", "bg": "#fff7ed"},
-    ]
+    factors = bls_factors + factors  # BLS data shown first
 
-    IMPACT_COLORS = {
-        "high-risk":   "#ef4444",
-        "risk":        "#f97316",
-        "conflict":    "#ef4444",
-        "caution":     "#fb923c",
-        "moderate":    "#eab308",
-        "positive":    "#22c55e",
-        "pull-factor": "#22c55e",
-        "push-factor": "#f97316",
-        "neutral":     "#9ca3af",
-    }
+    if not factors:
+        st.markdown("""
+        <div style='background:#fef9c3;border:1px solid #fde047;border-radius:8px;
+                    padding:14px 16px;color:#713f12;'>
+            <b>🌳 Not enough data to build a decision tree.</b><br>
+            Complete a full conversation first — the tree shows factors that actually shaped the decision.
+        </div>""", unsafe_allow_html=True)
+        return
 
-    # ── Build HTML ─────────────────────────────────────────────────────────────
-    winner       = option_a if avg_a >= avg_b else option_b
-    winner_color = "#16a34a" if avg_a >= avg_b else "#dc2626"
+    # ── Color scheme ──────────────────────────────────────────────────────────
+    dir_color = {"a": "#16a34a", "b": "#2563eb", "neutral": "#64748b"}
+    dir_bg    = {"a": "#f0fdf4", "b": "#eff6ff",  "neutral": "#f8fafc"}
+    dir_arrow = {"a": f"→ {opt_a[:16]}", "b": f"→ {opt_b[:16]}", "neutral": "↔ Both"}
 
-    agent_cols_html = ""
-    for ag in AGENTS:
-        aid   = ag["id"]
-        v     = agent_votes.get(aid, {})
-        va    = v.get("option_a", 50)
-        vb    = v.get("option_b", 50)
-        facts = agent_facts.get(aid, [])
+    # ── Build factor nodes HTML ───────────────────────────────────────────────
+    factor_nodes_html = ""
+    for i, f in enumerate(factors):
+        dc = dir_color[f["direction"]]
+        db = dir_bg[f["direction"]]
+        arrow = dir_arrow[f["direction"]]
+        is_api = f.get("source") == "api"
+        is_bls = f.get("source") == "bls"
 
-        facts_html = ""
-        for f in facts:
-            ic = IMPACT_COLORS.get(f["impact"], "#9ca3af")
-            facts_html += f"""
-            <div class="fact-card" style="border-left:3px solid {ag['border']}33;">
-              <div class="fact-header">
-                <span class="fact-label">{f['label']}</span>
-                <span class="fact-badge" style="background:{ic}18;color:{ic};border:1px solid {ic}44;">{f['impact']}</span>
-              </div>
-              <div class="fact-value">{f['value']}</div>
-              <div class="fact-note">{f['note']}</div>
-            </div>"""
+        # External data gets a distinct badge + highlight
+        source_badge = ""
+        border_style = f"1px solid {dc}30"
+        bg_style     = db
+        if is_api:
+            source_badge = ("<span style='background:#0ea5e9;color:white;font-size:9px;"
+                           "font-weight:700;padding:1px 5px;border-radius:3px;margin-left:6px;"
+                           "vertical-align:middle;'>SCORECARD</span>")
+            border_style = f"2px solid {dc}60"
+            bg_style     = f"linear-gradient(135deg, {db}, #f0f9ff)"
+        elif is_bls:
+            source_badge = ("<span style='background:#8b5cf6;color:white;font-size:9px;"
+                           "font-weight:700;padding:1px 5px;border-radius:3px;margin-left:6px;"
+                           "vertical-align:middle;'>BLS DATA</span>")
+            border_style = f"2px solid {dc}60"
+            bg_style     = f"linear-gradient(135deg, {db}, #faf5ff)"
 
-        if not facts_html:
-            facts_html = '<div class="fact-card no-facts">No facts collected for this agent</div>'
-
-        agent_cols_html += f"""
-        <div class="agent-col">
-          <div class="connector-v" style="background:linear-gradient(to bottom,#e2e8f0,{ag['border']});"></div>
-          <div class="agent-node" style="border:2px solid {ag['border']};background:{ag['bg']};">
-            <div class="agent-name" style="color:{ag['text']};">{ag['name']}</div>
-            <div class="vote-bar-wrap">
-              <div class="vote-bar-a" style="width:{va}%;"></div>
-              <div class="vote-bar-b" style="width:{vb}%;"></div>
-            </div>
-            <div class="vote-labels">
-              <span style="color:#16a34a;">{option_a[:14]} {va}%</span>
-              <span style="color:#dc2626;">{option_b[:14]} {vb}%</span>
-            </div>
+        factor_nodes_html += f"""
+        <div style="display:flex;align-items:stretch;margin-bottom:6px;">
+          <div style="width:24px;display:flex;flex-direction:column;align-items:center;flex-shrink:0;">
+            <div style="width:2px;background:#cbd5e1;flex:1;"></div>
+            <div style="width:12px;height:2px;background:#cbd5e1;"></div>
+            <div style="width:2px;background:#cbd5e1;flex:1;{"display:none" if i==len(factors)-1 else ""}"></div>
           </div>
-          <div class="connector-v" style="background:{ag['border']}88;height:16px;"></div>
-          <div class="facts-col">{facts_html}</div>
+          <div style="flex:1;background:{bg_style};border:{border_style};border-radius:8px;
+              padding:7px 12px;margin-left:4px;display:flex;align-items:center;gap:10px;">
+            <div style="flex:1;">
+              <div style="font-size:10px;color:#94a3b8;text-transform:uppercase;letter-spacing:.05em;">
+                {f["category"]}{source_badge}
+              </div>
+              <div style="font-size:12px;font-weight:600;color:#1e293b;">
+                {f["name"]}: <span style="color:{dc};">{f["value"][:60]}</span>
+              </div>
+              <div style="font-size:11px;color:#64748b;margin-top:1px;">{f["impact"]}</div>
+            </div>
+            <div style="background:{dc}18;color:{dc};border:1px solid {dc}40;border-radius:4px;
+                padding:2px 8px;font-size:10px;font-weight:700;white-space:nowrap;">{arrow}</div>
+          </div>
         </div>"""
 
-    html = f"""<!DOCTYPE html>
-<html>
-<head>
-<meta charset="UTF-8">
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ font-family: 'Inter', sans-serif; background: #f8fafc; padding: 20px; }}
+    # ── Agent votes panel ─────────────────────────────────────────────────────
+    agent_rows_html = ""
+    for ag in agents:
+        v   = agent_votes.get(ag["id"], {})
+        va  = v.get("option_a", 50)
+        vb  = v.get("option_b", 50)
+        lean = opt_a if va >= vb else opt_b
+        lc   = "#16a34a" if va >= vb else "#dc2626"
+        agent_rows_html += f"""
+        <div style="display:flex;align-items:center;gap:8px;padding:5px 0;border-bottom:1px solid #f1f5f9;">
+          <span style="font-size:16px;">{ag["emoji"]}</span>
+          <span style="font-size:11px;font-weight:600;color:{ag["color"]};flex:1;">{ag["name"]}</span>
+          <span style="font-size:11px;color:#64748b;">{opt_a[:10]} {va}% · {opt_b[:10]} {vb}%</span>
+          <span style="background:{lc}18;color:{lc};border:1px solid {lc}40;
+              border-radius:4px;padding:1px 7px;font-size:10px;font-weight:700;">→ {lean}</span>
+        </div>"""
 
-  .tree-header {{ text-align: center; margin-bottom: 24px; }}
-  .tree-title {{ font-size: 13px; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 6px; }}
-  .tree-subtitle {{ font-size: 11px; color: #94a3b8; }}
+    # ── Legend note for external data ─────────────────────────────────────────
+    has_api = any(f.get("source") == "api" for f in factors)
+    has_bls = any(f.get("source") == "bls" for f in factors)
+    ext_legend = ""
+    if has_api:
+        ext_legend += "<div style='font-size:10px;margin-top:4px;'><span style='background:#0ea5e9;color:white;font-size:9px;font-weight:700;padding:1px 4px;border-radius:3px;'>SCORECARD</span> = U.S. Dept. of Education verified data</div>"
+    if has_bls:
+        ext_legend += "<div style='font-size:10px;margin-top:4px;'><span style='background:#8b5cf6;color:white;font-size:9px;font-weight:700;padding:1px 4px;border-radius:3px;'>BLS DATA</span> = Bureau of Labor Statistics verified data</div>"
 
-  .root-node {{
-    background: white; border: 2px solid #e2e8f0; border-radius: 14px;
-    padding: 18px 28px; max-width: 520px; margin: 0 auto;
-    box-shadow: 0 2px 12px rgba(0,0,0,0.06);
-  }}
-  .root-label {{ font-size: 11px; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px; }}
-  .root-options {{ font-size: 16px; font-weight: 700; margin-bottom: 14px; }}
-  .opt-a {{ color: #16a34a; }}
-  .opt-sep {{ color: #cbd5e1; margin: 0 10px; }}
-  .opt-b {{ color: #dc2626; }}
-  .overall-bar {{ display: flex; border-radius: 6px; overflow: hidden; height: 10px; margin-bottom: 8px; }}
-  .overall-bar-a {{ background: linear-gradient(to right, #16a34a, #22c55e); }}
-  .overall-bar-b {{ background: linear-gradient(to right, #dc2626, #f87171); }}
-  .overall-labels {{ display: flex; justify-content: space-between; font-size: 12px; font-family: 'JetBrains Mono', monospace; align-items: center; }}
-  .winner-chip {{
-    background: {winner_color}15; color: {winner_color}; border: 1px solid {winner_color}44;
-    border-radius: 5px; padding: 1px 10px; font-size: 11px; font-weight: 700;
-  }}
-
-  .horiz-bar {{ max-width: 900px; margin: 0 auto; position: relative; height: 28px; }}
-  .horiz-line {{ position: absolute; top: 0; left: 12.5%; right: 12.5%; height: 2px;
-    background: linear-gradient(to right, #22c55e55, #3b82f655, #a855f755, #f9731655); }}
-  .vert-tick {{ position: absolute; top: 0; width: 2px; height: 28px; transform: translateX(-50%); }}
-
-  .agents-row {{ display: flex; gap: 12px; max-width: 960px; margin: 0 auto; align-items: flex-start; }}
-  .agent-col {{ display: flex; flex-direction: column; align-items: center; flex: 1; min-width: 0; }}
-  .connector-v {{ width: 2px; height: 28px; }}
-
-  .agent-node {{ width: 100%; border-radius: 10px; padding: 12px 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }}
-  .agent-name {{ font-size: 12px; font-weight: 700; margin-bottom: 8px; }}
-  .vote-bar-wrap {{ display: flex; border-radius: 4px; overflow: hidden; height: 7px; margin-bottom: 5px; }}
-  .vote-bar-a {{ background: #22c55e; }}
-  .vote-bar-b {{ background: #ef4444; }}
-  .vote-labels {{ display: flex; justify-content: space-between; font-size: 10px; font-family: 'JetBrains Mono', monospace; }}
-
-  .facts-col {{ width: 100%; display: flex; flex-direction: column; gap: 6px; }}
-  .fact-card {{
-    background: white; border-radius: 8px; padding: 9px 11px;
-    border: 1px solid #f1f5f9; transition: box-shadow 0.15s, transform 0.15s;
-    cursor: default;
-  }}
-  .fact-card:hover {{ box-shadow: 0 4px 16px rgba(0,0,0,0.10); transform: translateY(-1px); }}
-  .no-facts {{ color: #9ca3af; font-size: 11px; border: 1px dashed #e2e8f0; text-align: center; padding: 12px; }}
-  .fact-header {{ display: flex; justify-content: space-between; align-items: flex-start; gap: 6px; margin-bottom: 4px; }}
-  .fact-label {{ font-size: 10px; font-weight: 600; color: #64748b; text-transform: uppercase; letter-spacing: 0.04em; line-height: 1.3; }}
-  .fact-badge {{ font-size: 9px; font-family: 'JetBrains Mono', monospace; border-radius: 4px; padding: 1px 6px; white-space: nowrap; flex-shrink: 0; }}
-  .fact-value {{ font-size: 13px; font-weight: 600; color: #1e293b; margin-bottom: 3px; font-family: 'JetBrains Mono', monospace; }}
-  .fact-note {{ font-size: 10px; color: #94a3b8; line-height: 1.4; display: none; }}
-  .fact-card:hover .fact-note {{ display: block; }}
-
-  .legend {{ display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; margin-top: 20px; padding-top: 16px; border-top: 1px solid #e2e8f0; }}
-  .legend-item {{ display: flex; align-items: center; gap: 5px; font-size: 10px; color: #64748b; }}
-  .legend-dot {{ width: 8px; height: 8px; border-radius: 50%; }}
-</style>
-</head>
-<body>
-  <div class="tree-header">
-    <div class="tree-title">🌳 Decision Reasoning Tree</div>
-    <div class="tree-subtitle">Hover any fact card to see how it influenced the council's reasoning</div>
+    # ── Final HTML ────────────────────────────────────────────────────────────
+    html = f"""<!DOCTYPE html><html><head><meta charset="UTF-8">
+<style>*{{box-sizing:border-box;margin:0;padding:0;}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Inter",sans-serif;background:#f8fafc;padding:16px;}}</style>
+</head><body>
+<div style="background:linear-gradient(135deg,#1e3a5f,#2563eb);border-radius:10px;padding:14px 18px;
+    margin-bottom:4px;color:white;text-align:center;">
+  <div style="font-size:13px;font-weight:700;">{opt_a} vs {opt_b}</div>
+  <div style="font-size:11px;opacity:0.8;margin-top:2px;">{len(factors)} factors — {"paired comparison" if subtype=="university_comparison" else "factor analysis"}</div>
+</div>
+<div style="display:flex;justify-content:center;"><div style="width:2px;height:14px;background:#cbd5e1;"></div></div>
+<div style="display:grid;grid-template-columns:1fr 270px;gap:12px;align-items:start;">
+  <div style="background:white;border-radius:10px;padding:14px;border:1px solid #e2e8f0;">
+    <div style="font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.07em;margin-bottom:10px;">
+      Factors That Shaped This Decision
+    </div>
+    <div style="display:flex;align-items:center;gap:6px;margin-bottom:6px;">
+      <div style="width:24px;text-align:center;">
+        <div style="width:12px;height:12px;border-radius:50%;background:#2563eb;margin:auto;"></div>
+      </div>
+      <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;padding:4px 10px;
+          font-size:11px;font-weight:600;color:#2563eb;">Decision Root</div>
+    </div>
+    {factor_nodes_html}
+    {ext_legend}
   </div>
-
-  <div class="root-node">
-    <div class="root-label">Decision</div>
-    <div class="root-options">
-      <span class="opt-a">{option_a}</span>
-      <span class="opt-sep">vs</span>
-      <span class="opt-b">{option_b}</span>
+  <div>
+    <div style="background:{win_color}18;border:2px solid {win_color}50;border-radius:10px;
+        padding:12px 14px;margin-bottom:10px;text-align:center;">
+      <div style="font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;margin-bottom:4px;">Council Outcome</div>
+      <div style="font-size:16px;font-weight:700;color:{win_color};">{winner}</div>
+      <div style="font-size:12px;color:{win_color};opacity:0.8;">{win_pct}% aggregate lean</div>
     </div>
-    <div class="overall-bar">
-      <div class="overall-bar-a" style="width:{avg_a}%;"></div>
-      <div class="overall-bar-b" style="width:{avg_b}%;"></div>
+    <div style="background:white;border-radius:10px;padding:12px 14px;border:1px solid #e2e8f0;">
+      <div style="font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px;">Agent Votes</div>
+      {agent_rows_html}
     </div>
-    <div class="overall-labels">
-      <span style="color:#16a34a;">{avg_a}% {option_a}</span>
-      <span class="winner-chip">Council → {winner}</span>
-      <span style="color:#dc2626;">{avg_b}% {option_b}</span>
+    <div style="background:#f8fafc;border-radius:8px;padding:10px 12px;margin-top:10px;border:1px solid #e2e8f0;">
+      <div style="font-size:10px;font-weight:700;color:#64748b;text-transform:uppercase;margin-bottom:6px;">Legend</div>
+      <div style="font-size:10px;color:#16a34a;margin-bottom:3px;">🟢 → {opt_a[:18]}: factor favors this option</div>
+      <div style="font-size:10px;color:#2563eb;margin-bottom:3px;">🔵 → {opt_b[:18]}: factor favors this option</div>
+      <div style="font-size:10px;color:#64748b;">⚫ ↔ Both: neutral or applies to both</div>
     </div>
   </div>
+</div>
+</body></html>"""
 
-  <div class="horiz-bar">
-    <div class="horiz-line"></div>
-    <div class="vert-tick" style="left:12.5%;background:#22c55e88;"></div>
-    <div class="vert-tick" style="left:37.5%;background:#3b82f688;"></div>
-    <div class="vert-tick" style="left:62.5%;background:#a855f788;"></div>
-    <div class="vert-tick" style="left:87.5%;background:#f9731688;"></div>
-  </div>
-
-  <div class="agents-row">
-    {agent_cols_html}
-  </div>
-
-  <div class="legend">
-    <div class="legend-item"><div class="legend-dot" style="background:#ef4444;"></div>high-risk / conflict</div>
-    <div class="legend-item"><div class="legend-dot" style="background:#f97316;"></div>risk / caution</div>
-    <div class="legend-item"><div class="legend-dot" style="background:#eab308;"></div>moderate</div>
-    <div class="legend-item"><div class="legend-dot" style="background:#22c55e;"></div>positive</div>
-    <div class="legend-item"><div class="legend-dot" style="background:#9ca3af;"></div>neutral</div>
-  </div>
-</body>
-</html>"""
-
-    max_facts = max((len(agent_facts.get(ag["id"], [])) for ag in AGENTS), default=3)
-    estimated_height = 200 + 60 + 90 + (max_facts * 66) + 80
-    components.html(html, height=estimated_height, scrolling=False)
+    height = max(520, len(factors) * 68 + 300)
+    components.html(html, height=height, scrolling=True)
 
 
 # ── Council view ───────────────────────────────────────────────────────────────
@@ -643,20 +900,22 @@ def render_council_perspectives():
         return
 
     try:
-        meta = st.session_state.state.decision_metadata
+        meta          = st.session_state.state.decision_metadata
         decision_type = meta.get("decision_type", "unknown")
-        options = meta.get("options_being_compared", [])
-
+        options       = meta.get("options_being_compared", [])
         print(f"[COUNCIL] Type: {decision_type}, Options: {options}")
 
-        if decision_type in ("career_choice", "education") and len(options) == 2:
+        if len(options) >= 2:
+            option_a, option_b = options[0], options[1]
+
+            # Header
             st.markdown(f"""
             <div style='text-align:center;padding:20px;
                         background:linear-gradient(90deg,#667eea 0%,#764ba2 100%);
                         border-radius:10px;margin-bottom:20px;'>
                 <h2 style='color:white;margin:0;'>Council of Experts</h2>
                 <p style='color:#f0f0f0;margin:8px 0 0 0;'>
-                    {options[0]} vs {options[1]} — 4 agents, one ruling
+                    {option_a} vs {option_b} — 3 independent analyses
                 </p>
             </div>
             """, unsafe_allow_html=True)
@@ -666,84 +925,115 @@ def render_council_perspectives():
                     st.session_state.state.to_dict()
                 )
 
-            option_a, option_b = options[0], options[1]
-            agents    = p.get("agents", [])
-            votes     = p.get("agent_votes", {})
-            avg_vote  = p.get("avg_vote", {})
+            agents   = p.get("agents", [])
+            votes    = p.get("agent_votes", {})
+            avg_vote = p.get("avg_vote", {})
+            avg_a    = avg_vote.get("option_a", 50)
+            avg_b    = avg_vote.get("option_b", 50)
 
-            # ── Round 1: agent vote cards ─────────────────────────────────
-            st.markdown("### Round 1 — Agent Votes")
+            # ── 3 Agent analysis cards ────────────────────────────────────────
+            st.markdown("### 🔍 Expert Analyses")
             cols = st.columns(len(agents))
             for i, agent in enumerate(agents):
                 with cols[i]:
-                    v = votes.get(agent["id"], {})
+                    v      = votes.get(agent["id"], {})
                     vote_a = v.get("option_a", 50)
                     vote_b = v.get("option_b", 50)
-                    leading = option_a if vote_a >= vote_b else option_b
-                    pct     = max(vote_a, vote_b)
+                    lean   = option_a if vote_a >= vote_b else option_b
+                    lean_pct = max(vote_a, vote_b)
 
                     st.markdown(f"""
                     <div style='background:{agent["bg"]};padding:12px;border-radius:10px;
                                 border-left:5px solid {agent["border"]};margin-bottom:8px;'>
                         <div style='font-size:1.5em;'>{agent["emoji"]}</div>
                         <strong style='color:{agent["color"]};font-size:0.85em;'>{agent["name"]}</strong><br>
-                        <span style='font-size:1.1em;font-weight:bold;'>Votes: {leading}</span><br>
-                        <span style='color:#555;font-size:0.8em;'>{option_a}: {vote_a}% | {option_b}: {vote_b}%</span>
+                        <span style='font-size:1em;font-weight:bold;'>Leans: {lean}</span><br>
+                        <span style='color:#555;font-size:0.78em;'>{option_a}: {vote_a}% | {option_b}: {vote_b}%</span>
                     </div>
                     """, unsafe_allow_html=True)
 
+                    # Extract ANALYSIS and KEY INSIGHT sections robustly
+                    # The agent output can have multi-line ANALYSIS — don't split on \n
                     raw = v.get("raw", "")
-                    reasoning = ""
-                    for line in raw.split("\n"):
-                        if line.startswith("REASONING:"):
-                            reasoning = line.replace("REASONING:", "").strip()
-                    if reasoning:
-                        st.caption(reasoning)
+                    analysis    = ""
+                    key_insight = ""
 
-            # ── Vote tally bar ────────────────────────────────────────────
+                    import re as _re
+                    # Extract ANALYSIS: block (everything up to next label or end)
+                    m_analysis = _re.search(
+                        r"ANALYSIS:\s*(.+?)(?=\nKEY INSIGHT:|\nLEAN:|$)",
+                        raw, _re.DOTALL | _re.IGNORECASE
+                    )
+                    if m_analysis:
+                        analysis = m_analysis.group(1).strip()
+
+                    # Extract KEY INSIGHT: line
+                    m_insight = _re.search(
+                        r"KEY INSIGHT:\s*(.+?)(?=\n[A-Z]+:|$)",
+                        raw, _re.DOTALL | _re.IGNORECASE
+                    )
+                    if m_insight:
+                        key_insight = m_insight.group(1).strip()
+
+                    # Fallback: if regex failed, try line-by-line
+                    if not analysis:
+                        in_analysis = False
+                        lines_buf   = []
+                        for line in raw.split("\n"):
+                            if line.strip().upper().startswith("ANALYSIS:"):
+                                in_analysis = True
+                                rest = line.split(":", 1)[-1].strip()
+                                if rest:
+                                    lines_buf.append(rest)
+                            elif in_analysis and line.strip().upper().startswith("KEY INSIGHT:"):
+                                break
+                            elif in_analysis and line.strip():
+                                lines_buf.append(line.strip())
+                        analysis = " ".join(lines_buf)
+
+                    if analysis:
+                        # Show full analysis text, not truncated
+                        st.markdown(f"""
+                        <div style='font-size:0.82em;color:#374151;line-height:1.5;
+                                    padding:8px 0;border-top:1px solid #e5e7eb;margin-top:6px;'>
+                            {analysis}
+                        </div>
+                        """, unsafe_allow_html=True)
+                    if key_insight:
+                        st.markdown(f"""
+                        <div style='background:white;padding:6px 10px;border-radius:6px;
+                                    border-left:3px solid {agent["border"]};margin-top:6px;
+                                    font-size:0.78em;font-weight:600;color:{agent["color"]};'>
+                            💡 {key_insight}
+                        </div>
+                        """, unsafe_allow_html=True)
+
+     # ── Aggregate vote bar ──────────────────────────────────────────────
             st.markdown("---")
-            avg_a = avg_vote.get("option_a", 50)
-            avg_b = avg_vote.get("option_b", 50)
-            st.markdown(f"**Aggregate vote: {option_a} {avg_a}% vs {option_b} {avg_b}%**")
-            st.progress(avg_a / 100)
+            winner    = option_a if avg_a >= avg_b else option_b
+            win_color = "#16a34a" if avg_a >= avg_b else "#dc2626"
+            st.markdown(f"""
+            <div style='margin:8px 0 4px 0;'>
+              <div style='display:flex;border-radius:8px;overflow:hidden;height:24px;'>
+                <div style='width:{avg_a}%;background:#16a34a;display:flex;align-items:center;
+                    justify-content:center;font-size:11px;font-weight:700;color:white;min-width:0;'>
+                  {"" if avg_a < 20 else f"{avg_a}%"}
+                </div>
+                <div style='width:{avg_b}%;background:#dc2626;display:flex;align-items:center;
+                    justify-content:center;font-size:11px;font-weight:700;color:white;min-width:0;'>
+                  {"" if avg_b < 20 else f"{avg_b}%"}
+                </div>
+              </div>
+              <div style='display:flex;justify-content:space-between;margin-top:5px;font-size:12px;'>
+                <span style='color:#16a34a;font-weight:600;'>🟢 {option_a} {avg_a}%</span>
+                <span style='background:{win_color}15;color:{win_color};border:1px solid {win_color}40;
+                    font-weight:700;border-radius:4px;padding:2px 10px;font-size:11px;'>→ {winner} wins</span>
+                <span style='color:#dc2626;font-weight:600;'>{avg_b}% {option_b} 🔴</span>
+              </div>
+            </div>
+            """, unsafe_allow_html=True)
 
-            # ── Round 2: debate ───────────────────────────────────────────
-            debating = p.get("debating_agents", {})
-            if debating and p.get("round2_a") and p.get("round2_b"):
-                st.markdown("### Round 2 — Debate")
-                agent_a_info = debating.get("a", {})
-                agent_b_info = debating.get("b", {})
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown(f"""
-                    <div style='background:#e3f2fd;padding:12px;border-radius:8px;
-                                border-left:4px solid #2196f3;margin-bottom:8px;'>
-                        <strong style='color:#1565c0;'>{agent_a_info.get("emoji","")} {agent_a_info.get("name","Agent A")} — for {option_a}</strong>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    st.markdown(p.get("round2_a", ""))
-                with col2:
-                    st.markdown(f"""
-                    <div style='background:#fce4ec;padding:12px;border-radius:8px;
-                                border-left:4px solid #e91e63;margin-bottom:8px;'>
-                        <strong style='color:#880e4f;'>{agent_b_info.get("emoji","")} {agent_b_info.get("name","Agent B")} — for {option_b}</strong>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    st.markdown(p.get("round2_b", ""))
-
-            # ── Round 3 (if triggered) ────────────────────────────────────
-            if p.get("has_round3"):
-                st.markdown("### Round 3 — Tiebreaker")
-                st.info("Close vote detected — triggering final round")
-                col1, col2 = st.columns(2)
-                with col1:
-                    st.markdown(f"**{debating.get('a',{}).get('emoji','')} {debating.get('a',{}).get('name','')}**")
-                    st.markdown(p.get("round3_a", ""))
-                with col2:
-                    st.markdown(f"**{debating.get('b',{}).get('emoji','')} {debating.get('b',{}).get('name','')}**")
-                    st.markdown(p.get("round3_b", ""))
-
-            # ── Synthesizer ruling ────────────────────────────────────────
+            # ── Synthesizer ruling ────────────────────────────────────────────
             st.markdown("---")
             st.markdown("""
             <div style='background:#fff3e0;padding:15px;border-radius:10px;
@@ -753,7 +1043,6 @@ def render_council_perspectives():
             """, unsafe_allow_html=True)
 
             synth_text = p.get("synthesizer", "No ruling available")
-            # Split out OPEN QUESTION if present and render it separately
             if "OPEN QUESTION:" in synth_text:
                 parts = synth_text.split("OPEN QUESTION:")
                 st.markdown(parts[0].strip())
@@ -767,14 +1056,18 @@ def render_council_perspectives():
             else:
                 st.markdown(synth_text)
 
-            # ── Decision Tree ─────────────────────────────────────────────
+            # ── Decision reasoning tree ───────────────────────────────────────
             st.markdown("---")
-            with st.expander("🌳 Decision Reasoning Tree — what facts shaped this outcome?", expanded=False):
-                st.caption("Each branch shows the facts collected for that agent and how they influenced its vote. Hover a fact card to see the reasoning.")
+            with st.expander("🌳 Decision Factor Tree", expanded=False):
+                st.caption(
+                    "Each branch is a fact collected from the conversation. "
+                    "Green = favors the left option. Blue = favors the right option. "
+                    "Grey = neutral or applies to both."
+                )
                 render_decision_tree(st.session_state.state.to_dict(), p)
 
         else:
-            # General 3-analyst fallback
+            # No options — general 3-analyst fallback
             st.markdown("""
             <div style='text-align:center;padding:20px;
                         background:linear-gradient(90deg,#ff6b6b 0%,#4ecdc4 50%,#45b7d1 100%);
@@ -790,24 +1083,24 @@ def render_council_perspectives():
 
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.markdown("#### Risk Analyst")
+                st.markdown("#### ⚠️ Risk Analyst")
                 st.markdown(p.get("risk", "No analysis"))
             with col2:
-                st.markdown("#### Opportunity Analyst")
+                st.markdown("#### 🚀 Opportunity Analyst")
                 st.markdown(p.get("opportunity", "No analysis"))
             with col3:
-                st.markdown("#### Values Coach")
+                st.markdown("#### 🎯 Values Analyst")
                 st.markdown(p.get("values", "No analysis"))
 
-        # ── Navigation buttons ────────────────────────────────────────────
+        # ── Navigation buttons ────────────────────────────────────────────────
         st.markdown("---")
         col_back, col_new = st.columns(2)
         with col_back:
-            if st.button("Back to Chat", use_container_width=True):
+            if st.button("← Back to Chat", use_container_width=True):
                 st.session_state.show_council = False
                 st.rerun()
         with col_new:
-            if st.button("Start New Decision", use_container_width=True):
+            if st.button("Start New Decision", use_container_width=True, type="primary"):
                 st.session_state.state = DecisionState()
                 st.session_state.messages = []
                 st.session_state.show_council = False
@@ -930,7 +1223,7 @@ def main():
                         st.code(st.session_state.llm_error)
         else:
             st.success("System Ready")
-            st.caption("Using Gemma 3 27B")
+            st.caption("Using Llama 3.3 70B · Groq")
 
         st.markdown("---")
         render_sidebar_state()
