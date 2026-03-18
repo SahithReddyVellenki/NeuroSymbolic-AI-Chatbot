@@ -1,11 +1,11 @@
 """
 LLM Interface - Natural language layer constrained by symbolic state
-Uses Google Gemini SDK.
+Uses Groq API (OpenAI-compatible) with Llama 3.3 70B.
 """
 
 import os
 import json
-import google.generativeai as genai
+from openai import OpenAI
 from typing import Dict, Optional, List, Tuple
 
 
@@ -14,9 +14,9 @@ class LLMInterface:
     Handles natural language interaction with strict constraints.
 
     The LLM is used ONLY for:
-    - Asking clarifying questions (2-3 lines, with humor, with contradiction callouts)
-    - Presenting a score-based conclusion
-    - Running a 4-agent structured debate with adaptive Round 3
+    - Asking clarifying questions (conversational, one question per turn)
+    - Constraint extraction (JSON structured output)
+    - Running 3 independent expert analyses + synthesizer
 
     It CANNOT override symbolic facts or give direct recommendations.
     """
@@ -31,6 +31,8 @@ class LLMInterface:
             "bg":    "#e8f5e9",
             "border":"#4caf50",
             "lens":  "salary, financial stability, income trajectory, debt risk, earning potential",
+            "forbidden": "Do NOT mention career fulfillment, passion, wellbeing, or personal values. Only money.",
+            "must_ask":  "What does the income gap and job market data say? How does existing debt change the calculus?",
         },
         {
             "id":    "growth",
@@ -39,7 +41,9 @@ class LLMInterface:
             "color": "#0d47a1",
             "bg":    "#e3f2fd",
             "border":"#2196f3",
-            "lens":  "career trajectory, skill development, industry demand, path to leadership",
+            "lens":  "career trajectory, skill development, industry demand, long-term advancement paths",
+            "forbidden": "Do NOT mention salary figures or emotional wellbeing. Only career paths and growth.",
+            "must_ask":  "Where does each path lead in 5-10 years? Which builds more transferable skills? Which has stronger industry demand?",
         },
         {
             "id":    "wellbeing",
@@ -48,254 +52,139 @@ class LLMInterface:
             "color": "#4a148c",
             "bg":    "#f3e5f5",
             "border":"#9c27b0",
-            "lens":  "stress, work-life balance, burnout risk, mental health, fulfillment",
-        },
-        {
-            "id":    "values",
-            "name":  "Values Alignment Agent",
-            "emoji": "🎯",
-            "color": "#bf360c",
-            "bg":    "#fbe9e7",
-            "border":"#ff5722",
-            "lens":  "alignment with stated values, identity, authenticity, long-term purpose",
+            "lens":  "fulfillment, stress risk, identity alignment, passion vs pragmatism tension",
+            "forbidden": "Do NOT cite salary numbers or job market statistics. Only human factors: identity, fulfillment, regret risk.",
+            "must_ask":  "Will they resent this choice in 10 years? What does their stated passion say vs their stated priorities? Is the tension between what they enjoy and what they chose manageable?",
         },
     ]
 
 
-    # ── Topic rotation for offer comparison ──────────────────────────────────
-    # Each tuple: (field_to_check, category, topic_label, question)
-    OFFER_QUESTION_TOPICS = [
-        ("role",               "offer_a",  "offer A — company and role",
-         "Tell me about the first offer — what's the company and the role?"),
-        ("role",               "offer_b",  "offer B — company and role",
-         "And the second offer — what company and what role?"),
-        ("salary",             "offer_a",  "offer A — salary",
-         "What's the salary or compensation for the first offer?"),
-        ("salary",             "offer_b",  "offer B — salary",
-         "And the salary for the second offer?"),
-        ("work_location",      "offer_a",  "offer A — remote, onsite or hybrid?",
-         "Is the first role remote, onsite, or hybrid?"),
-        ("work_location",      "offer_b",  "offer B — remote, onsite or hybrid?",
-         "And the second role — remote, onsite, or hybrid?"),
-        ("requires_relocation","offer_a",  "offer A — relocation needed?",
-         "Would you need to relocate for the first offer, or is it in your current city?"),
-        ("requires_relocation","offer_b",  "offer B — relocation needed?",
-         "Same question for the second offer — would it require relocating?"),
-        ("can_relocate",       "personal", "personal — can you relocate?",
-         "If relocation is involved, is that feasible for you right now? Any family or personal factors that affect that?"),
-        ("growth_potential",   "offer_a",  "offer A — growth potential",
-         "How does the growth potential look at the first company — clear paths to advance, or unclear?"),
-        ("growth_potential",   "offer_b",  "offer B — growth potential",
-         "And growth potential at the second company?"),
-        ("work_life_balance",  "offer_a",  "offer A — work-life balance",
-         "What's your sense of the work-life balance at the first company?"),
-        ("work_life_balance",  "offer_b",  "offer B — work-life balance",
-         "How about work-life balance at the second company?"),
-        ("concern",            "offer_a",  "biggest concern about offer A",
-         "What's your biggest concern or hesitation about the first offer?"),
-        ("concern",            "offer_b",  "biggest concern about offer B",
-         "And your biggest concern about the second offer?"),
-        ("financial_security", "values",   "how important is financial security",
-         "Overall, how important is financial security in this decision — on a scale of 1 to 10?"),
-        ("career_growth",      "values",   "how important is career growth",
-         "And career growth — how important is that to you right now?"),
-        ("work_life_balance",  "values",   "how important is work-life balance",
-         "Last one — how much does work-life balance weigh into this for you?"),
-    ]
 
-    # ── Topic rotation for university comparison ───────────────────────────────
-    UNIVERSITY_QUESTION_TOPICS = [
-        ("name",               "uni_a",   "university A — name and program",
-         "Tell me about the first university — which school and what program?"),
-        ("name",               "uni_b",   "university B — name and program",
-         "And the second university — which school and program?"),
-        ("tuition",            "uni_a",   "university A — tuition and cost",
-         "What's the tuition or total cost for the first option? Any scholarships?"),
-        ("tuition",            "uni_b",   "university B — tuition and cost",
-         "And the cost for the second university? Any financial aid?"),
-        ("requires_relocation","uni_a",   "university A — location and relocation",
-         "Where is the first university located — would you need to move there?"),
-        ("requires_relocation","uni_b",   "university B — location and relocation",
-         "And the second university — same question, where is it and does it mean relocating?"),
-        ("can_relocate",       "personal","personal — relocation feasibility",
-         "If either requires moving, is that realistic for you right now — any family or life factors?"),
-        ("living_cost",        "uni_a",   "university A — cost of living",
-         "What's the cost of living like in the city where the first university is?"),
-        ("living_cost",        "uni_b",   "university B — cost of living",
-         "And cost of living for the second university's city?"),
-        ("ranking",            "uni_a",   "university A — reputation and ranking",
-         "How does the first university rank in your field — is it well known for this program?"),
-        ("ranking",            "uni_b",   "university B — reputation and ranking",
-         "And the second university's reputation in this field?"),
-        ("job_placement",      "uni_a",   "university A — job placement",
-         "Do you know anything about job placement or alumni network at the first school?"),
-        ("job_placement",      "uni_b",   "university B — job placement",
-         "Same question for the second school?"),
-        ("concern",            "uni_a",   "biggest concern about university A",
-         "What's your biggest concern or hesitation about the first university?"),
-        ("concern",            "uni_b",   "biggest concern about university B",
-         "And your biggest concern about the second university?"),
-        ("financial_security", "values",  "how important is minimizing debt",
-         "How important is minimizing student debt in this decision — 1 to 10?"),
-        ("career_growth",      "values",  "how important is career reputation",
-         "And how much does the university's reputation and career outcomes matter to you?"),
-    ]
-
-    # ── Topic rotation for major / field choice ──────────────────────────────
-    MAJOR_CHOICE_QUESTION_TOPICS = [
-        ("current_year",        "current",       "what year are you in",
-         "What year are you in right now — are you still deciding before starting, or already a year or two in?"),
-        ("leaning",             "current",       "current leaning and why",
-         "Which one are you leaning toward currently, and what's pulling you that way?"),
-        ("hands_on_work",       "interests",     "hands-on vs theoretical",
-         "Do you prefer hands-on, practical work — building and tinkering — or more abstract, theoretical problem solving?"),
-        ("post_graduation_goal","career_vision", "goal after graduation",
-         "What do you want to do after graduating — industry job, further study, or something else?"),
-        ("desired_role_5yr",    "career_vision", "5-year vision",
-         "Where do you see yourself in 5 years — what kind of role or industry?"),
-        ("financial_security",  "values",        "how important is salary",
-         "How important is earning potential in this decision — on a scale of 1 to 10?"),
-        ("enjoys_theory",       "interests",     "interest in theory vs building",
-         "Which sounds more exciting — understanding how things work at a deep level, or building systems that solve real problems?"),
-        ("career_growth",       "values",        "career growth priority",
-         "Is fast career progression important to you, or are you more focused on doing work you genuinely find interesting?"),
-        ("work_life_balance",   "values",        "work-life balance priority",
-         "Which field do you think gives better work-life balance — and how much does that matter to you?"),
-        ("job_market_concern",  "current",       "job market awareness",
-         "How aware are you of the job market for each option — do you know which one tends to hire more or pay better right now?"),
-        ("financial_concern",   "current",       "any financial or family constraints",
-         "Are there any financial or family factors that might influence this choice — scholarships, family expectations, cost differences?"),
-        ("concern",             "current",       "biggest concern about the choice",
-         "What's your biggest concern about making the wrong choice here?"),
-    ]
-
-    MAJOR_CHOICE_TOPIC_CHECKS = {
-        "what year are you in":               ("current",       ["current_year"]),
-        "current leaning and why":            ("current",       ["leaning"]),
-        "hands-on vs theoretical":            ("interests",     ["hands_on_work", "enjoys_theory", "enjoys_building_systems"]),
-        "goal after graduation":              ("career_vision", ["post_graduation_goal"]),
-        "5-year vision":                      ("career_vision", ["desired_role_5yr", "research_vs_applied"]),
-        "how important is salary":            ("values",        ["financial_security"]),
-        "interest in theory vs building":     ("interests",     ["enjoys_theory", "enjoys_building_systems", "hands_on_work"]),
-        "career growth priority":             ("values",        ["career_growth", "impact"]),
-        "work-life balance priority":         ("values",        ["work_life_balance"]),
-        "job market awareness":               ("current",       ["job_market_concern"]),
-        "any financial or family constraints":("current",       ["financial_concern"]),
-        "biggest concern about the choice":   ("current",       ["concern"]),
-    }
-
-    # ── Topic rotation for job-vs-business decisions ─────────────────────────
-    JOB_VS_BUSINESS_QUESTION_TOPICS = [
-        ("current_satisfaction", "current",  "current job satisfaction",
-         "How do you feel about your current job — are you enjoying it, just tolerating it, or actively miserable?"),
-        ("business_idea",        "current",  "business idea clarity",
-         "How developed is your business idea — do you have a specific concept, or is it still a vague feeling that you want to work for yourself?"),
-        ("leave_reason",         "current",  "what's driving the urge to leave",
-         "What's actually pushing you toward leaving — is it excitement about the business, frustration with the job, or both?"),
-        ("current_role",         "current",  "current role and field",
-         "What kind of work do you do now, and is the business idea in the same field or something different entirely?"),
-        ("financial_runway",     "current",  "financial runway",
-         "How long could you realistically survive financially without income — do you have savings set aside for this?"),
-        ("has_family",           "personal", "family and financial obligations",
-         "Do you have family dependents or significant financial commitments — mortgage, loans, kids — that factor into this?"),
-        ("partner_employed",     "personal", "partner or support system",
-         "Is there a partner or anyone else contributing to household income — or are you the sole earner?"),
-        ("financial_security",   "values",   "risk tolerance",
-         "How important is financial stability to you right now, on a scale of 1 to 10?"),
-        ("career_growth",        "values",   "career growth priority",
-         "Is the business idea about making more money, doing more meaningful work, or having more freedom — what's the main pull?"),
-        ("business_validated",   "current",  "business idea validation",
-         "Have you tested the business idea at all — any early customers, side income from it, or market research?"),
-        ("work_life_balance",    "values",   "work-life balance priority",
-         "Running a business often means longer hours, especially early on — how important is work-life balance to you?"),
-        ("concern",              "current",  "biggest concern",
-         "What's your biggest fear about making the wrong choice here?"),
-    ]
-
-    JOB_VS_BUSINESS_TOPIC_CHECKS = {
-        "current job satisfaction":         ("current",  ["current_satisfaction"]),
-        "business idea clarity":            ("current",  ["business_idea"]),
-        "what's driving the urge to leave": ("current",  ["leave_reason"]),
-        "current role and field":           ("current",  ["current_role"]),
-        "financial runway":                 ("current",  ["financial_runway"]),
-        "family and financial obligations": ("personal", ["has_family", "has_dependents"]),
-        "partner or support system":        ("personal", ["partner_employed"]),
-        "risk tolerance":                   ("values",   ["financial_security"]),
-        "career growth priority":           ("values",   ["career_growth", "impact"]),
-        "business idea validation":         ("current",  ["business_validated"]),
-        "work-life balance priority":       ("values",   ["work_life_balance"]),
-        "biggest concern":                  ("current",  ["concern"]),
-    }
-
-    # ── Topic rotation for data collection (education_path: PhD vs Job etc.) ────
-    CAREER_QUESTION_TOPICS = [
-        ("post_graduation_goal", "career_vision",
-         "primary goal after graduation",
-         "What's your primary goal after finishing your degree — are you looking to get a job, continue studying, or something else?"),
-        ("hands_on_work", "interests",
-         "work style preference",
-         "Do you prefer hands-on practical work or more theoretical / research-oriented work?"),
-        ("research_vs_applied", "career_vision",
-         "applied vs research lean",
-         "Do you lean more toward applied industry work, or do you enjoy deep research and publishing?"),
-        ("current_satisfaction", "current",
-         "current job satisfaction",
-         "How satisfied are you with your current job on a scale of 1-10 — is something pushing you away, or is this purely about the PhD opportunity?"),
-        ("desired_role_5yr", "career_vision",
-         "5-year vision",
-         "Where do you see yourself in 5 years — what kind of role or industry are you aiming for?"),
-        ("financial_security", "values",
-         "financial security priority",
-         "How important is financial stability in this decision — a PhD stipend is significantly less than most industry salaries. Scale of 1-10?"),
-        ("financial_runway", "current",
-         "financial runway for PhD",
-         "Do you have savings or financial support that would make living on a PhD stipend workable — any dependents or loans to consider?"),
-        ("has_family", "personal",
-         "family or personal obligations",
-         "Do you have a partner, kids, or any personal obligations that would be affected by a PhD — location, time commitment, income drop?"),
-        ("career_growth", "values",
-         "growth vs balance",
-         "Is fast career progression more important to you, or doing work you find genuinely interesting — even if it pays less or takes longer?"),
-        ("work_life_balance", "values",
-         "work-life balance priority",
-         "PhDs can be demanding and isolating — how much does work-life balance factor into your thinking on a scale of 1-10?"),
-        ("concern", "current",
-         "biggest concern about the choice",
-         "What's your biggest fear about making the wrong call here — financial, losing industry momentum, or something else?"),
-        ("job_market_concern", "current",
-         "industry opportunity cost",
-         "Do you feel like staying in your current job has real upside — promotions, growth, interesting projects — or does it feel like it's plateauing?"),
-    ]
-
-    def __init__(self, api_key: Optional[str] = None, model: str = "gemma-3-27b-it"):
-        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
+    def __init__(self, api_key: Optional[str] = None,
+                 model: str = "llama-3.3-70b-versatile",
+                 bls_path: str = "bls_ooh_chunks.jsonl"):
+        self.api_key = api_key or os.getenv("GROQ_API_KEY")
         if not self.api_key:
-            raise ValueError("Google API key required.")
-        genai.configure(api_key=self.api_key)
+            raise ValueError("Groq API key required. Set GROQ_API_KEY env var.")
+
+        # Build a list of clients — primary key first, fallback key second
+        self._clients: list = [
+            OpenAI(api_key=self.api_key, base_url="https://api.groq.com/openai/v1")
+        ]
+        fallback_key = os.getenv("GROQ_API_KEY2")
+        if fallback_key and fallback_key != self.api_key:
+            self._clients.append(
+                OpenAI(api_key=fallback_key, base_url="https://api.groq.com/openai/v1")
+            )
+            print(f"[API] Loaded {len(self._clients)} Groq API keys")
+        else:
+            print("[API] Single Groq API key loaded (set GROQ_API_KEY2 for fallback)")
+
+        # Keep self.client pointing to primary for any legacy code
+        self.client = self._clients[0]
         self.model_name = model
-        self.model = genai.GenerativeModel(model)
         self.conversation_history: List[Dict] = []
-        self.asked_topics: Dict[str, int] = {}  # label -> times asked, for loop guard
-
-    # ── Core API call ─────────────────────────────────────────────────────────
-    def _call_gemini(self, messages: List[Dict], system_prompt: str = "") -> str:
-        full_prompt = ""
-        if system_prompt:
-            full_prompt += f"{system_prompt}\n\n"
-        for msg in messages:
-            role = "User" if msg["role"] == "user" else "Assistant"
-            full_prompt += f"{role}: {msg['content']}\n\n"
-
+        self.turn_count: int = 0
+        self._bls = None
         try:
-            response = self.model.generate_content(full_prompt)
-            if hasattr(response, "text") and response.text:
-                return response.text.strip()
-            if hasattr(response, "parts") and response.parts:
-                return response.parts[0].text.strip()
-            return "I'm having trouble responding. Could you rephrase that?"
+            from bls_retriever import BLSRetriever
+            self._bls = BLSRetriever(bls_path)
         except Exception as e:
-            print(f"[API] Error: {e}")
-            return "I encountered an error. Could you repeat that?"
+            print(f"[BLS] Could not load: {e}")
+
+        self._college = None
+        try:
+            from college_retriever import CollegeRetriever
+            self._college = CollegeRetriever()
+        except Exception as e:
+            print(f"[COLLEGE] Could not load: {e}")
+
+    # ── Core API call (Groq / OpenAI-compatible) ────────────────────────────────
+    def _call_llm(self, messages: List[Dict], system_prompt: str = "",
+                  max_tokens: int = 800) -> str:
+        """
+        Call Groq with automatic fallback on rate limits AND auth failures.
+
+        Tries each (client, model) combination in order:
+          - client1 + llama-3.3-70b-versatile  (primary)
+          - client2 + llama-3.3-70b-versatile  (backup key, same model)
+          - client1 + llama-3.1-8b-instant     (fallback model)
+          - client1 + gemma2-9b-it             (last resort)
+
+        Rate limit (429) → retry with backoff, then try next client/model.
+        Auth error (401) → skip this client immediately, try next.
+        Other errors     → bail immediately (bad request, model not found etc).
+        """
+        import time
+        chat_messages = []
+        if system_prompt:
+            chat_messages.append({"role": "system", "content": system_prompt})
+        for msg in messages:
+            chat_messages.append({"role": msg["role"], "content": msg["content"]})
+
+        clients   = getattr(self, "_clients", [self.client])
+        fallbacks = getattr(self, "_model_fallbacks",
+                            [self.model_name, "llama-3.1-8b-instant", "gemma2-9b-it"])
+        start_model_idx = getattr(self, "_current_model_idx", 0)
+        last_err  = None
+
+        for model_idx in range(start_model_idx, len(fallbacks)):
+            model = fallbacks[model_idx]
+            if model_idx > start_model_idx:
+                print(f"[API] Switched to fallback model: {model}")
+
+            for client_idx, client in enumerate(clients):
+                key_label = f"key{client_idx + 1}/{model}"
+
+                for attempt in range(3):
+                    try:
+                        resp = client.chat.completions.create(
+                            model=model,
+                            messages=chat_messages,
+                            temperature=0.7,
+                            max_tokens=max_tokens,
+                        )
+                        if model_idx != getattr(self, "_current_model_idx", 0):
+                            self._current_model_idx = model_idx
+                            print(f"[API] Now using {model} for this session")
+                        if client_idx > 0:
+                            print(f"[API] Success with key{client_idx + 1}")
+                        return resp.choices[0].message.content.strip()
+
+                    except Exception as e:
+                        last_err = e
+                        err_str  = str(e).lower()
+                        is_rate  = any(x in err_str for x in
+                                       ("rate", "429", "limit", "quota", "exceeded"))
+                        is_auth  = "401" in err_str or "invalid_api_key" in err_str or "invalid api key" in err_str
+
+                        if is_auth:
+                            print(f"[API] Auth error on key{client_idx+1} — trying next key")
+                            break  # try next client
+
+                        elif is_rate:
+                            if attempt < 2:
+                                wait = 5 * (2 ** attempt)  # 5s, 10s
+                                print(f"[API] Rate limit ({key_label}), "
+                                      f"waiting {wait}s (attempt {attempt+1}/3)")
+                                time.sleep(wait)
+                            else:
+                                print(f"[API] Rate limit exhausted ({key_label}) "
+                                      f"— trying next key/model...")
+                                break  # try next client
+
+                        else:
+                            # Unrecoverable: bad request, model not found etc
+                            print(f"[API] Unrecoverable error on {key_label}: {e}")
+                            return "I encountered an error. Could you repeat that?"
+
+        print(f"[API] All options exhausted. Last error: {last_err}")
+        return "I encountered an error. Could you repeat that?"
+
+
+    # Alias so any existing internal call to _call_gemini still works
+    def _call_gemini(self, messages: List[Dict], system_prompt: str = "") -> str:
+        return self._call_llm(messages, system_prompt)
 
     # ── Constraint extraction ─────────────────────────────────────────────────
     def extract_constraints(self, user_message: str, current_state: Dict) -> Dict:
@@ -306,31 +195,44 @@ class LLMInterface:
 
 Detect the decision type, subtype, and options. Be precise.
 
-Examples:
+CRITICAL RULE — check OFFER COMPARISON first:
+If the message mentions "offer", "offers", "job offer", OR two company names with context
+like "join", "choose", "which one", "deciding between" — it is ALWAYS offer_comparison.
+Do NOT classify as major_choice or career_choice if offers/companies are mentioned.
 
-JOB OFFER COMPARISON — "2 job offers", "choosing between two offers", "job at Google vs startup":
-→ {{"decision_metadata": {{"decision_type": "career_choice", "decision_subtype": "offer_comparison", "options_being_compared": ["<company/offer A name>", "<company/offer B name>"]}}}}
-→ If companies not named yet, use ["Offer 1", "Offer 2"]
+Examples (in priority order):
 
-UNIVERSITY COMPARISON — "which university should I pick", "MIT vs Stanford for masters", "choosing between two schools":
-→ {{"decision_metadata": {{"decision_type": "education", "decision_subtype": "university_comparison", "options_being_compared": ["<university A>", "<university B>"]}}}}
-→ If universities not named yet, use ["University 1", "University 2"]
+1. JOB OFFER COMPARISON (highest priority):
+   Triggers: "offer", "job offer", "offer from X", "offer from X and Y", "join X or Y",
+             "company A vs company B", "two offers", "which one to join"
+   → {{"decision_metadata": {{"decision_type": "career_choice", "decision_subtype": "offer_comparison", "options_being_compared": ["<company A>", "<company B>"]}}}}
+   Examples: "offer from Apple and Google" → offer_comparison: ["Apple", "Google"]
+             "join Amazon or Microsoft" → offer_comparison: ["Amazon", "Microsoft"]
+             "choosing between two job offers" → offer_comparison: ["Offer 1", "Offer 2"]
 
-EDUCATION PATH — "PhD vs job", "should I do a PhD", "masters or work":
-→ {{"decision_metadata": {{"decision_type": "education", "decision_subtype": "education_path", "options_being_compared": ["PhD", "Job"]}}}}
+2. UNIVERSITY COMPARISON:
+   Triggers: "university", "college", "school", "MIT vs Stanford", "which program"
+   → {{"decision_metadata": {{"decision_type": "education", "decision_subtype": "university_comparison", "options_being_compared": ["<university A>", "<university B>"]}}}}
 
-MAJOR/FIELD CHOICE — "CS vs DS", "computer science or data science", "which major":
-→ {{"decision_metadata": {{"decision_type": "career_choice", "decision_subtype": "major_choice", "options_being_compared": ["CS", "DS"]}}}}
+3. EDUCATION PATH (PhD vs work):
+   Triggers: "PhD vs job", "should I do a PhD", "masters or work", "academia vs industry"
+   → {{"decision_metadata": {{"decision_type": "education", "decision_subtype": "education_path", "options_being_compared": ["PhD", "Job"]}}}}
 
-LOCATION — "move to NYC or stay", "which city should I move to":
-→ {{"decision_metadata": {{"decision_type": "location", "decision_subtype": "location_choice", "options_being_compared": ["NYC", "Stay"]}}}}
+4. MAJOR/FIELD CHOICE (academic fields, no company names):
+   Triggers: "CS vs DS", "computer science or data science", "which major", "which field to study"
+   Note: Only use this if NO company names or job offers are mentioned.
+   → {{"decision_metadata": {{"decision_type": "career_choice", "decision_subtype": "major_choice", "options_being_compared": ["<field A>", "<field B>"]}}}}
 
-JOB VS BUSINESS — "should I quit my job", "resign and start a business", "leave job to start startup", "job or entrepreneurship":
-→ {{"decision_metadata": {{"decision_type": "career_choice", "decision_subtype": "job_vs_business", "options_being_compared": ["Start Business", "Continue Job"]}}}}
-→ If they name the business or job specifically, use those names
+5. JOB VS BUSINESS:
+   Triggers: "quit my job", "start a business", "leave job", "entrepreneurship vs job",
+             "passion vs job", "follow my passion", "pursue passion", "job or passion",
+             "job or my dream", "continue job or pursue"
+   → {{"decision_metadata": {{"decision_type": "career_choice", "decision_subtype": "job_vs_business", "options_being_compared": ["Continue Job", "Pursue Passion"]}}}}
+   IMPORTANT: Any message about choosing between a stable job and a passion/dream/business
+   is ALWAYS job_vs_business -- even if phrased as "continue my career or follow my passion"
 
-ANYTHING ELSE:
-→ {{"decision_metadata": {{"decision_type": "general", "decision_subtype": "general", "options_being_compared": []}}}}
+6. ANYTHING ELSE:
+   → {{"decision_metadata": {{"decision_type": "general", "decision_subtype": "general", "options_being_compared": []}}}}
 
 Return ONLY valid JSON:
 {{"extracted": {{"decision_metadata": {{...}}}}}}"""
@@ -384,7 +286,12 @@ MAPPING RULES:
 - "work from home" / "remote" → work_location = "remote"
 - "need to move" / "different city" → requires_relocation = true
 - "same city" / "no relocation" → requires_relocation = false
+- "out of state" / "out-of-state" → tuition tier only, NOT requires_relocation
+  (out-of-state = higher tuition; requires_relocation = must physically move)
 - "I have a family" / "my spouse" / "my kids" → has_family = true, has_dependents = true
+- If has_family/has_dependents = true AND any offer requires_relocation = true → personal.can_relocate = false
+- "I can't relocate" / "can't move" / "need to stay" / "wife/husband won't move" → personal.can_relocate = false
+- "open to relocating" / "fine with moving" / "flexible on location" → personal.can_relocate = true
 - "startup feels risky" → job_security = "low", concern = "startup risk"
 - "lots of room to grow" → growth_potential = "high"
 
@@ -394,45 +301,76 @@ Return ONLY valid JSON. Omit empty categories:
 If nothing extractable: {{"extracted": {{}}, "user_emotional_state": "neutral"}}"""
 
             elif decision_subtype == "university_comparison":
-                system_prompt = f"""Extract facts from this message about a university comparison ({opt_a} vs {opt_b}).
+                system_prompt = f"""Extract facts from this conversation message about choosing between universities ({opt_a} vs {opt_b}).
 
-Message: "{user_message}"
+Message to extract from: "{user_message}"
 
-UNIVERSITY A details (category: "uni_a") — facts about {opt_a}:
-- name: string (university name)
-- program: string (degree program / major)
-- tuition: number (annual, convert "40k/year"→40000, "20 lakhs total"→200000)
-- tuition_raw: string (original)
-- scholarship: string (amount or description)
-- location: string (city / country)
-- requires_relocation: true / false
-- living_cost: "high" / "medium" / "low" or numeric monthly
-- ranking: string (ranking or reputation note)
-- job_placement: string (placement rate or reputation)
-- research_interest: string (specific professor/lab interest)
-- concern: string (user's hesitation)
+CONTEXT: The question context will be prepended separately. Use it to interpret short answers.
 
-UNIVERSITY B details (category: "uni_b") — same fields as uni_a
+UNIVERSITY A — {opt_a} (category: "uni_a"):
+- name: string
+- program: string (degree/major — e.g. "Computer Science", "MBA")
+- tuition: number (annual in USD; convert "35k/yr"→35000, "20k"→20000)
+  ONLY set if user explicitly states a dollar amount. If they say "out of state" with no number, leave null.
+- scholarship: string ("none", "partial", "full", or amount)
+- location: string (city name)
+- requires_relocation: true/false
+- living_cost: "high"/"medium"/"low"
+- ranking: string (reputation note — e.g. "well known", "top 50", "lesser known")
+- job_placement: string (known placement quality)
+- concern: string (user's hesitation about THIS university)
+- preferred: true/false (user explicitly prefers this one)
+
+UNIVERSITY B — {opt_b} (category: "uni_b"):
+- same fields as uni_a
 
 PERSONAL CONTEXT (category: "personal"):
-- has_family: true / false
-- can_relocate: true / false
-- relocation_concern: string
+- has_family: true/false
+- has_dependents: true/false
+- can_relocate: true/false  ("relocate all around" / "flexible" / "no restrictions" → true)
 - current_city: string
+- social_connection: string (friends/family near which campus)
+- city_preference: "big city" / "small town" / "no preference"
+
+INTERESTS (category: "interests"):
+- field_of_interest: string (specific area within their major — e.g. "software development", "AI", "networking")
+- hands_on_work: true/false
+- research: true/false
+
+CAREER VISION (category: "career_vision"):
+- post_graduation_goal: "job" / "phd" / "startup" / "undecided"
+- desired_role_5yr: string (e.g. "software engineer", "data scientist")
+- target_location: string (where they want to work after graduating)
+- work_anywhere: true/false (willing to work anywhere in country)
+
+FINANCIAL (category: "financial"):
+- taking_student_debt: true/false
+- debt_concern: "high"/"medium"/"low"
+
+CURRENT SITUATION (category: "current"):
+- concern: string (biggest overall worry — e.g. "missing out on job opportunities", "cost of living")
+- leaning: string (which university they lean toward and why)
 
 VALUES (category: "values"):
-- financial_security (1-10), career_growth (1-10)
+- financial_security: 1-10
+- career_growth: 1-10
+- work_life_balance: 1-10
+- reputation_importance: 1-10 (how much the school's name matters)
 
-MAPPING RULES:
-- "first university / {opt_a}" → uni_a; "second / {opt_b}" → uni_b
-- "scholarship covers 50%" → scholarship = "50% covered"
-- "need to move there" → requires_relocation = true
-- "same city as me" → requires_relocation = false
-- "top 10 school" → ranking = "top 10"
-- "good placement" → job_placement = "good"
+EXTRACTION RULES — apply these to interpret the user's message:
+- "relocate all around the country" / "can move anywhere" / "flexible on location" → personal.can_relocate = true, career_vision.work_anywhere = true
+- "taking student debt" / "student loan" / "no scholarships" → financial.taking_student_debt = true, uni_a.scholarship = "none", uni_b.scholarship = "none"
+- "friend at {opt_b}" / "know people at {opt_b}" → personal.social_connection = "friend at {opt_b}"
+- "prefer bigger city" / "big city" → personal.city_preference = "big city", supports {opt_a} if {opt_a} is in bigger city
+- "reputation matters" / "name recognition" → values.reputation_importance = 8
+- "FOMO on jobs" / "fear of missing out on opportunities" → current.concern = "fear of missing out on better job opportunities"
+- "a bit important" for cost of living → values.financial_security = 6
+- "development" / "software development" as area of interest → interests.field_of_interest = "software development"
+- If user says same program at both universities → set program field on BOTH uni_a AND uni_b
+- "want to work in industry" / "get a job" → career_vision.post_graduation_goal = "job"
 
 Return ONLY valid JSON. Omit empty categories:
-{{"extracted": {{"uni_a": {{}}, "uni_b": {{}}, "personal": {{}}, "values": {{}}}}, "user_emotional_state": "uncertain"}}
+{{"extracted": {{"uni_a": {{}}, "uni_b": {{}}, "personal": {{}}, "interests": {{}}, "career_vision": {{}}, "financial": {{}}, "current": {{}}, "values": {{}}}}, "user_emotional_state": "uncertain"}}
 
 If nothing extractable: {{"extracted": {{}}, "user_emotional_state": "neutral"}}"""
 
@@ -510,10 +448,18 @@ CURRENT SITUATION (category: "current"):
 - current_satisfaction: 1-10 or "happy"/"ok"/"unhappy"/"miserable"
 - business_idea: string (description of the business concept)
 - business_validated: true/false (has tested with real customers or earned side income)
-- financial_runway: string (e.g. "6 months savings", "no savings", "12 months")
+- financial_runway: string — keep this as a human-readable label ("no savings", "6 months", "2 years")
 - leave_reason: string (frustration with job / excitement about business / both / freedom)
 - concern: string (biggest fear about making the wrong choice)
-- job_market_concern: true/false
+- current_monthly_salary: number (monthly, convert if needed: "60k/year"→5000, "5k/month"→5000)
+
+FINANCIAL (category: "financial"):
+- financial_runway_months: number — CRITICAL: convert any runway mention to months
+  Examples: "2 years" → 24, "1.5 years" → 18, "6 months" → 6, "3 months" → 3,
+            "no savings" → 0, "minimal" → 1, "a year maybe" → 12,
+            "2 years maybe" → 24, "about a year" → 12, "few months" → 3
+- current_income: number (monthly salary/income)
+- monthly_expenses: number (monthly expenses if mentioned)
 
 PERSONAL CONTEXT (category: "personal"):
 - has_family: true/false
@@ -531,11 +477,16 @@ MAPPING RULES:
 - "I hate my job / bored / no growth" → current_satisfaction = 3, leave_reason = "job frustration"
 - "I have a business idea" → business_idea = description
 - "I've already got some customers / side income" → business_validated = true
-- "no savings / can't afford to quit" → financial_runway = "minimal"
-- "6 months runway / savings" → financial_runway = "6 months"
+- "no savings / can't afford to quit" → current.financial_runway = "no savings", financial.financial_runway_months = 0
+- "6 months runway / savings" → current.financial_runway = "6 months", financial.financial_runway_months = 6
+- "2 years savings / runway" → current.financial_runway = "2 years", financial.financial_runway_months = 24
 - "I want freedom / be my own boss" → leave_reason = "desire for autonomy"
 - "I have a family / kids / mortgage" → has_family = true, has_dependents = true
 - "salary / stability matters to me" → values.financial_security = 8
+- Monthly salary mentions: "5k", "$5000/month", "earning 5000" → financial.current_income = 5000
+- Annual salary: "60k/year", "$60,000" → financial.current_income = 5000
+
+CRITICAL: financial_runway_months MUST be a number. Always convert time expressions to months.
 
 Return ONLY valid JSON. Omit empty categories:
 {{"extracted": {{"current": {{}}, "personal": {{}}, "values": {{}}}}, "user_emotional_state": "uncertain"}}
@@ -566,10 +517,24 @@ VALUES (category: "values"):
   learning (1-10), impact (1-10)
 
 FINANCIAL (category: "financial"):
-- salary_importance (1-10), expected_salary (number)
+- salary_importance (1-10)
+- expected_salary: number (annual USD — "100k" → 100000, "six figures" → 100000)
+- debt_total: number ("no debt" / "nothing" / "none" / "zero" → 0, "30k" → 30000)
+- taking_student_debt: true/false
 
 CURRENT (category: "current"):
 - job_market_concern (true/false), current_satisfaction (1-10)
+- leaning: string (which option they lean toward)
+- concern: string (biggest fear)
+
+MAPPING RULES for this generic extractor:
+- "nothing" / "no debt" / "debt-free" as answer to debt question → financial.debt_total = 0
+- "$100k" / "100k" / "six figures" as salary target → financial.expected_salary = 100000
+- "single" / "no family" / "no partner" → personal.has_dependents = false
+- "i can relocate" / "flexible on location" → personal.can_relocate = true
+- "hands-on" / "coding" / "technical" → interests.hands_on_work = true, interests.enjoys_coding = true
+- "team lead" / "lead engineer" → career_vision.desired_role_5yr = "team lead"
+- "collaborat" → values.work_life_balance = 7 (team-oriented person)
 
 Return ONLY valid JSON. Omit empty categories:
 {{"extracted": {{"interests": {{}}}}, "user_emotional_state": "uncertain"}}
@@ -605,352 +570,403 @@ If nothing extractable: {{"extracted": {{}}, "user_emotional_state": "neutral"}}
 
     # ── Response generation ───────────────────────────────────────────────────
     def generate_response(self, user_message: str, state_dict: Dict, mode: str = "conversational") -> str:
-        # Track which topic we're about to ask, so loop guard can count it
-        # FIX: apply to ALL subtypes, not just offer/university comparison
-        subtype = state_dict.get("decision_metadata", {}).get("decision_subtype", "general")
-        topic_label, _ = self._get_next_topic(state_dict)
-        self.asked_topics[topic_label] = self.asked_topics.get(topic_label, 0) + 1
-        print(f"[ASKED] '{topic_label}' x{self.asked_topics[topic_label]}")
-
-        system_prompt = self._get_conversational_mode_prompt(state_dict)
-        messages = self.conversation_history + [{"role": "user", "content": user_message}]
-        response = self._call_gemini(messages=messages, system_prompt=system_prompt)
-        self.conversation_history.append({"role": "user", "content": user_message})
-        self.conversation_history.append({"role": "assistant", "content": response})
-        return response
-
-    # Multi-field topic definitions — a topic is "answered" if ANY of these fields is set
-    # This prevents asking the same question when the user answered via a synonym field
-    OFFER_TOPIC_CHECKS = {
-        "offer A — company and role":       ("offer_a", ["company", "role"]),
-        "offer B — company and role":       ("offer_b", ["company", "role"]),
-        "offer A — salary":                 ("offer_a", ["salary", "salary_raw"]),
-        "offer B — salary":                 ("offer_b", ["salary", "salary_raw"]),
-        "offer A — remote, onsite or hybrid?":  ("offer_a", ["work_location"]),
-        "offer B — remote, onsite or hybrid?":  ("offer_b", ["work_location"]),
-        "offer A — relocation needed?":     ("offer_a", ["requires_relocation"]),
-        "offer B — relocation needed?":     ("offer_b", ["requires_relocation"]),
-        "personal — can you relocate?":     ("personal", ["can_relocate", "has_family", "relocation_concern"]),
-        "offer A — growth potential":       ("offer_a", ["growth_potential"]),
-        "offer B — growth potential":       ("offer_b", ["growth_potential"]),
-        "offer A — work-life balance":      ("offer_a", ["work_life_balance"]),
-        "offer B — work-life balance":      ("offer_b", ["work_life_balance"]),
-        "biggest concern about offer A":    ("offer_a", ["concern"]),
-        "biggest concern about offer B":    ("offer_b", ["concern"]),
-        "how important is financial security": ("values", ["financial_security"]),
-        "how important is career growth":   ("values", ["career_growth"]),
-        "how important is work-life balance": ("values", ["work_life_balance"]),
-    }
-
-    UNIVERSITY_TOPIC_CHECKS = {
-        "university A — name and program":  ("uni_a", ["name", "program"]),
-        "university B — name and program":  ("uni_b", ["name", "program"]),
-        "university A — tuition and cost":  ("uni_a", ["tuition", "tuition_raw", "scholarship"]),
-        "university B — tuition and cost":  ("uni_b", ["tuition", "tuition_raw", "scholarship"]),
-        "university A — location and relocation": ("uni_a", ["requires_relocation", "location"]),
-        "university B — location and relocation": ("uni_b", ["requires_relocation", "location"]),
-        "personal — relocation feasibility":("personal", ["can_relocate", "has_family"]),
-        "university A — cost of living":    ("uni_a", ["living_cost"]),
-        "university B — cost of living":    ("uni_b", ["living_cost"]),
-        "university A — reputation and ranking": ("uni_a", ["ranking", "job_placement"]),
-        "university B — reputation and ranking": ("uni_b", ["ranking", "job_placement"]),
-        "biggest concern about university A": ("uni_a", ["concern"]),
-        "biggest concern about university B": ("uni_b", ["concern"]),
-        "how important is minimizing debt": ("values", ["financial_security"]),
-        "how important is career reputation": ("values", ["career_growth"]),
-    }
-
-    def _is_topic_answered(self, label: str, state_dict: Dict, topic_checks: Dict) -> bool:
-        """Check if a topic is answered by looking at all relevant fields."""
-        if label not in topic_checks:
-            return False
-        category, fields = topic_checks[label]
-        cat_data = state_dict.get(category, {})
-        return any(
-            cat_data.get(f) not in (None, False, "", [])
-            for f in fields
-        )
-
-    def _get_next_topic(self, state_dict: Dict) -> Tuple[str, str]:
         """
-        Return (topic_label, question_text) for the next unanswered topic.
-        Uses multi-field topic checks so that synonym fields (salary vs salary_raw)
-        correctly mark a topic as answered.
-        Also respects asked_topics to avoid infinite loops.
+        Pure conversational approach — no question plans, no classification.
+        The LLM sees the full conversation history + a system prompt that tells it:
+          - What decision is being made
+          - What topics to cover across the conversation
+          - When it has enough info, wrap up and mention Council of Experts
+        The LLM decides which question to ask next naturally.
         """
-        subtype = state_dict.get("decision_metadata", {}).get("decision_subtype", "general")
+        self.turn_count += 1
+        options   = state_dict.get("decision_metadata", {}).get("options_being_compared", [])
+        opt_a     = options[0] if len(options) > 0 else "Option A"
+        opt_b     = options[1] if len(options) > 1 else "Option B"
+        violations = [v.get("description", "") for v in state_dict.get("violations", [])]
 
-        if subtype == "offer_comparison":
-            topic_list   = self.OFFER_QUESTION_TOPICS
-            topic_checks = self.OFFER_TOPIC_CHECKS
-        elif subtype == "university_comparison":
-            topic_list   = self.UNIVERSITY_QUESTION_TOPICS
-            topic_checks = self.UNIVERSITY_TOPIC_CHECKS
-        elif subtype == "major_choice":
-            topic_list   = self.MAJOR_CHOICE_QUESTION_TOPICS
-            topic_checks = self.MAJOR_CHOICE_TOPIC_CHECKS
-        elif subtype == "job_vs_business":
-            topic_list   = self.JOB_VS_BUSINESS_QUESTION_TOPICS
-            topic_checks = self.JOB_VS_BUSINESS_TOPIC_CHECKS
-        else:
-            # education_path, general — CAREER_QUESTION_TOPICS with multi-field checks
-            topic_list   = self.CAREER_QUESTION_TOPICS
-            topic_checks = {
-                "primary goal after graduation":    ("career_vision", ["post_graduation_goal"]),
-                "work style preference":            ("interests",     ["hands_on_work", "enjoys_theory", "research"]),
-                "applied vs research lean":         ("career_vision", ["research_vs_applied"]),
-                "current job satisfaction":         ("current",       ["current_satisfaction"]),
-                "5-year vision":                    ("career_vision", ["desired_role_5yr", "research_vs_applied"]),
-                "financial security priority":      ("values",        ["financial_security"]),
-                "financial runway for PhD":         ("current",       ["financial_runway", "has_dependents"]),
-                "family or personal obligations":   ("personal",      ["has_family", "has_dependents", "partner_employed"]),
-                "growth vs balance":                ("values",        ["career_growth", "work_life_balance"]),
-                "work-life balance priority":       ("values",        ["work_life_balance"]),
-                "biggest concern about the choice": ("current",       ["concern"]),
-                "industry opportunity cost":        ("current",       ["job_market_concern"]),
-            }
-
-        for field_key, category, label, question in topic_list:
-            # Skip if already answered (multi-field check)
-            if self._is_topic_answered(label, state_dict, topic_checks):
-                continue
-            # Skip if we've already asked this topic twice without getting an answer
-            # (loop guard — prevents infinite repeat)
-            times_asked = self.asked_topics.get(label, 0)
-            if times_asked >= 2:
-                print(f"[LOOP GUARD] Skipping '{label}' — asked {times_asked} times, no answer")
-                continue
-            return label, question
-
-        return "any remaining concerns", "Is there anything else that feels unresolved?"
-
-    def _get_active_violations(self, state_dict: Dict) -> List[str]:
-        """Return list of current violation descriptions."""
-        return [v["description"] for v in state_dict.get("violations", [])]
-
-    def _get_conversational_mode_prompt(self, state_dict: Dict) -> str:
-        decision_type = state_dict.get("decision_metadata", {}).get("decision_type", "unknown")
-        options       = state_dict.get("decision_metadata", {}).get("options_being_compared", [])
-
-        option_a = options[0] if len(options) > 0 else "Option A"
-        option_b = options[1] if len(options) > 1 else "Option B"
-
-        interests  = state_dict.get("interests", {})
-        values     = state_dict.get("values", {})
-        career_vis = state_dict.get("career_vision", {})
-        financial  = state_dict.get("financial", {})
-        current    = state_dict.get("current", {})
-        violations = self._get_active_violations(state_dict)
-
-        subtype  = state_dict.get("decision_metadata", {}).get("decision_subtype", "general")
-        offer_a  = state_dict.get("offer_a", {})
-        offer_b  = state_dict.get("offer_b", {})
-        uni_a    = state_dict.get("uni_a", {})
-        uni_b    = state_dict.get("uni_b", {})
-        personal = state_dict.get("personal", {})
-
-        def _has(d, *keys):
-            return any(d.get(k) not in (None, False, "", []) for k in keys)
-
-        # ── Topic-based counting (not field counting) ─────────────────────────
-        # Each meaningful topic = 1, regardless of how many fields it fills
-        if subtype == "offer_comparison":
-            topics = [
-                _has(offer_a, "company", "role"),          # topic: what is offer A
-                _has(offer_b, "company", "role"),          # topic: what is offer B
-                _has(offer_a, "salary", "salary_raw"),     # topic: salary A
-                _has(offer_b, "salary", "salary_raw"),     # topic: salary B
-                _has(offer_a, "work_location"),            # topic: remote/onsite A
-                _has(offer_b, "work_location"),            # topic: remote/onsite B
-                _has(offer_a, "requires_relocation"),      # topic: relocation A
-                _has(offer_b, "requires_relocation"),      # topic: relocation B
-                _has(personal, "can_relocate", "has_family", "relocation_concern"),  # topic: personal/family
-                _has(offer_a, "growth_potential"),         # topic: growth A
-                _has(offer_b, "growth_potential"),         # topic: growth B
-                _has(offer_a, "work_life_balance"),        # topic: WLB A
-                _has(offer_b, "work_life_balance"),        # topic: WLB B
-                _has(offer_a, "concern"),                  # topic: concern A
-                _has(offer_b, "concern"),                  # topic: concern B
-                _has(values, "financial_security", "career_growth", "work_life_balance"),  # topic: values
-            ]
-            relevant_count = sum(topics)
-            threshold = 10  # must cover at least 10 meaningful topics
-
-        elif subtype == "university_comparison":
-            topics = [
-                _has(uni_a, "name", "program"),            # topic: what is uni A
-                _has(uni_b, "name", "program"),            # topic: what is uni B
-                _has(uni_a, "tuition", "tuition_raw"),     # topic: cost A
-                _has(uni_b, "tuition", "tuition_raw"),     # topic: cost B
-                _has(uni_a, "requires_relocation", "location"),  # topic: location A
-                _has(uni_b, "requires_relocation", "location"),  # topic: location B
-                _has(personal, "can_relocate", "has_family"),    # topic: personal/family
-                _has(uni_a, "living_cost"),                # topic: living cost A
-                _has(uni_b, "living_cost"),                # topic: living cost B
-                _has(uni_a, "ranking", "job_placement"),   # topic: reputation A
-                _has(uni_b, "ranking", "job_placement"),   # topic: reputation B
-                _has(uni_a, "concern"),                    # topic: concern A
-                _has(uni_b, "concern"),                    # topic: concern B
-                _has(values, "financial_security", "career_growth"),  # topic: values
-            ]
-            relevant_count = sum(topics)
-            threshold = 9
-
-        elif subtype == "major_choice":
-            topics = [
-                _has(current,    "current_year"),
-                _has(current,    "leaning"),
-                _has(interests,  "hands_on_work", "enjoys_theory", "enjoys_building_systems"),
-                _has(career_vis, "post_graduation_goal"),
-                _has(career_vis, "desired_role_5yr", "research_vs_applied"),
-                _has(values,     "financial_security"),
-                _has(values,     "career_growth", "impact"),
-                _has(values,     "work_life_balance"),
-                _has(current,    "job_market_concern"),
-                _has(current,    "financial_concern"),
-                _has(current,    "concern"),
-            ]
-            relevant_count = sum(topics)
-            threshold = 9  # need 9 of 11 topics
-
-        elif subtype == "job_vs_business":
-            topics = [
-                _has(current,    "current_satisfaction"),
-                _has(current,    "business_idea"),
-                _has(current,    "leave_reason"),
-                _has(current,    "current_role"),
-                _has(current,    "financial_runway"),
-                _has(personal,   "has_family", "has_dependents"),
-                _has(personal,   "partner_employed"),
-                _has(values,     "financial_security"),
-                _has(values,     "career_growth", "impact"),
-                _has(current,    "business_validated"),
-                _has(values,     "work_life_balance"),
-                _has(current,    "concern"),
-            ]
-            relevant_count = sum(topics)
-            threshold = 9  # need 9 of 12 topics
-
-        elif decision_type in ("career_choice", "education"):
-            # Topic-based counting — robust, matches other subtypes
-            topics = [
-                _has(career_vis, "post_graduation_goal"),
-                _has(interests,  "hands_on_work", "enjoys_theory", "research"),
-                _has(career_vis, "research_vs_applied"),
-                _has(current,    "current_satisfaction"),
-                _has(career_vis, "desired_role_5yr"),
-                _has(values,     "financial_security"),
-                _has(current,    "financial_runway"),
-                _has(personal,   "has_family", "has_dependents"),
-                _has(values,     "career_growth", "work_life_balance"),
-                _has(current,    "concern"),
-                _has(current,    "job_market_concern"),
-            ]
-            relevant_count = sum(topics)
-            threshold = 9  # need 9 of 11 topics
-        else:
-            relevant_count = sum(
-                1 for cat in [financial, values]
-                for v in cat.values() if v is not None
-            )
-            threshold = 6
-
-        print(f"[PROMPT] type={decision_type} facts={relevant_count}/{threshold} violations={len(violations)}")
-
-        # ── CONCLUDE ─────────────────────────────────────────────────────────
-        if relevant_count >= threshold:
-            if subtype == "offer_comparison":
-                known_facts = {
-                    f"{option_a} details": {k: v for k, v in offer_a.items() if v is not None and v != ""},
-                    f"{option_b} details": {k: v for k, v in offer_b.items() if v is not None and v != ""},
-                    "personal context":    {k: v for k, v in personal.items() if v is not None and v != ""},
-                    "your values":         {k: v for k, v in values.items()  if v is not None},
-                }
-            elif subtype == "university_comparison":
-                known_facts = {
-                    f"{option_a} details": {k: v for k, v in uni_a.items() if v is not None and v != ""},
-                    f"{option_b} details": {k: v for k, v in uni_b.items() if v is not None and v != ""},
-                    "personal context":    {k: v for k, v in personal.items() if v is not None and v != ""},
-                    "your values":         {k: v for k, v in values.items()  if v is not None},
-                }
-            elif subtype == "major_choice":
-                known_facts = {
-                    "current situation": {k: v for k, v in current.items()    if v is not None and v != ""},
-                    "interests":         {k: v for k, v in interests.items()  if v is not None and v is not False},
-                    "career vision":     {k: v for k, v in career_vis.items() if v is not None and v != ""},
-                    "values":            {k: v for k, v in values.items()     if v is not None},
-                }
-            elif subtype == "job_vs_business":
-                known_facts = {
-                    "current situation": {k: v for k, v in current.items()   if v is not None and v != ""},
-                    "personal context":  {k: v for k, v in personal.items()  if v is not None and v != ""},
-                    "values":            {k: v for k, v in values.items()     if v is not None},
-                }
-            else:
-                known_facts = {
-                    "interests":     {k: v for k, v in interests.items()  if v is not None and v is not False},
-                    "values":        {k: v for k, v in values.items()     if v is not None},
-                    "career_vision": {k: v for k, v in career_vis.items() if v is not None and v != ""},
-                    "financial":     {k: v for k, v in financial.items()  if v is not None},
-                    "current":       {k: v for k, v in current.items()    if v is not None},
-                }
-
-            violations_str = ""
-            if violations:
-                violations_str = f"\nContradictions noted: {violations}"
-
-            return f"""TASK: Wrap up the conversation — do NOT give a score or recommendation.
-
-Decision: {option_a} vs {option_b}
-Collected facts:
-{json.dumps(known_facts, indent=2)}{violations_str}
-
-Write EXACTLY this (3-4 sentences total):
-
-"Great, I think I have a solid picture of your situation. [1 sentence summarizing the key tension or tradeoff — e.g. 'You're weighing financial stability at {option_a} against the growth upside at {option_b}, with relocation being a key personal constraint.'] The council of expert agents will now analyze this from multiple angles and debate it. Click the **Council of Experts** button below to see the full analysis."
-
-HARD RULES:
-- Final sentence MUST contain "Council of Experts"
-- Do NOT give a percentage score — the council will do that
-- Do NOT say which option is better
-- Do NOT give advice
-- Maximum 4 sentences"""
-
-        # ── COLLECTING ───────────────────────────────────────────────────────
-        topic_label, next_question = self._get_next_topic(state_dict)
-
-        # Build violation callout if any exist
+        # Build violation callout if symbolic engine found a constraint issue
         violation_note = ""
         if violations:
-            violation_note = f"""
-IMPORTANT: The user has a contradiction in their answers: "{violations[0]}"
-Before asking your question, call this out in a friendly but direct way in 1 sentence.
-"""
+            trace = state_dict.get("reasoning_trace", {})
+            fired = trace.get("fired_rules", [])
+            priority = next((r for r in fired if r.get("severity") == "critical"),
+                            next((r for r in fired if r.get("severity") == "warning"), None))
+            if priority:
+                violation_note = (
+                    f"\n\nIMPORTANT: Before asking your next question, briefly flag this "
+                    f"contradiction the system detected: \"{priority.get('conclusion', '')}\". "
+                    f"One sentence, warm tone, then continue."
+                )
 
-        return f"""You are a witty, warm decision-support assistant helping someone decide: {option_a} vs {option_b}.
+        # ── Agent coverage check — conclude when all 3 buckets filled OR turn limit hit ──
+        #
+        # Each agent needs specific facts to avoid hallucinating.
+        # Financial bucket:  salary/tuition/debt/runway
+        # Career bucket:     role goal, work style, industry preference
+        # Wellbeing bucket:  concern, passion, stress tolerance, city/life preference
+        #
+        # Conclude when: (all 3 buckets have >= 1 fact AND turns >= 8)
+        #             OR turns >= 15 (hard cap)
+        # University comparisons also require reputation + cost data.
 
-You have {relevant_count}/{threshold} facts. Your job this turn: ask about "{topic_label}".
-The exact question to ask: "{next_question}"{violation_note}
+        financial  = state_dict.get("financial", {})
+        current    = state_dict.get("current", {})
+        values     = state_dict.get("values", {})
+        personal   = state_dict.get("personal", {})
+        interests  = state_dict.get("interests", {})
+        career_vis = state_dict.get("career_vision", {})
+        uni_a_data = state_dict.get("uni_a", {})
+        uni_b_data = state_dict.get("uni_b", {})
 
-RULES:
-- 2-3 sentences total
-- Add a brief, dry observation or light humor before the question — something that shows you're paying attention to what they said, not just running through a checklist
-- If there's a contradiction callout above, lead with that (still keep it warm, not accusatory)
-- Ask exactly the one question above — do not invent different questions
-- No advice, no summaries, no reflecting their words back at length
-- Conversational tone, like a smart friend — not a therapist, not a robot"""
+        def _has(*dicts_and_keys):
+            for d, *keys in dicts_and_keys:
+                if any(d.get(k) not in (None, False, "", []) for k in keys):
+                    return True
+            return False
 
-    # ── Council debate (4 fixed agents) ──────────────────────────────────────
-    def generate_council_perspectives(self, state_dict: Dict) -> Dict:
-        decision_type = state_dict.get("decision_metadata", {}).get("decision_type", "unknown")
-        options       = state_dict.get("decision_metadata", {}).get("options_being_compared", [])
+        # Financial bucket: tuition / salary / debt / financial priority
+        # Financial bucket is "covered" if:
+        # - we have actual numbers (income, tuition, debt), OR
+        # - user explicitly said money doesn't matter (financial_security = 1 or 2)
+        fin_low_priority = (
+            values.get("financial_security") is not None and
+            isinstance(values.get("financial_security"), (int, float)) and
+            values["financial_security"] <= 2
+        )
+        fin_covered = fin_low_priority or _has(
+            (financial, "current_income", "financial_runway_months"),
+            (financial, "taking_student_debt"),
+            (values,    "financial_security"),
+            (uni_a_data,"tuition"), (uni_b_data,"tuition"),
+            (current,   "financial_runway"),
+            (current,   "current_monthly_salary", "debt_amount", "financial_concern"),
+        )
+        # Career bucket: target role / work style / field interest
+        career_covered = _has(
+            (career_vis, "desired_role_5yr", "post_graduation_goal"),
+            (interests,  "field_of_interest", "hands_on_work", "research"),
+            (current,    "current_role", "leave_reason"),
+        )
+        # Wellbeing bucket: concern / preference / city / passion
+        wellbeing_covered = _has(
+            (current,   "concern"),
+            (personal,  "city_preference", "social_connection"),
+            (values,    "work_life_balance", "reputation_importance"),
+            (current,   "leaning", "business_idea"),
+        )
 
-        if decision_type in ("career_choice", "education") and len(options) == 2:
-            return self._run_agent_debate(state_dict, options)
+        all_covered   = fin_covered and career_covered and wellbeing_covered
+        hard_cap      = self.turn_count >= 15
+        soft_conclude = all_covered and self.turn_count >= 8
+
+        should_conclude = hard_cap or soft_conclude
+
+        covered_count = sum([fin_covered, career_covered, wellbeing_covered])
+        print(f"[TURN {self.turn_count}] Coverage: fin={fin_covered} career={career_covered} "
+              f"wellbeing={wellbeing_covered} ({covered_count}/3) conclude={should_conclude}")
+
+        if should_conclude:
+            missing = []
+            if not fin_covered:     missing.append("financial situation")
+            if not career_covered:  missing.append("career goals")
+            if not wellbeing_covered: missing.append("personal preferences")
+
+            known_facts = []
+            if current.get("leaning"):       known_facts.append(f"leaning: {current['leaning']}")
+            if current.get("concern"):       known_facts.append(f"concern: {current['concern']}")
+            if values.get("financial_security"): known_facts.append(f"financial priority: {values['financial_security']}/10")
+            if personal.get("has_dependents"): known_facts.append("has dependents")
+            facts_summary = (", ".join(known_facts) + ".") if known_facts else ""
+
+            missing_note = ""
+            if missing:
+                missing_note = (f" Note: limited data on {', '.join(missing)} — "
+                                f"agents will flag where analysis is thin.")
+
+            conclusion_prompt = f"""The conversation about "{opt_a} vs {opt_b}" has gathered enough information.
+
+Key facts: {facts_summary}{missing_note}
+
+Write a 3-sentence wrap-up:
+1. "Great, I think I have a solid picture of your situation."
+2. One sentence naming the central tension or tradeoff this person faces.
+3. "The council of expert agents will now analyze this — click the Council of Experts button below."
+
+Rules: Do NOT recommend. Do NOT score. Must end with "Council of Experts"."""
+
+            response = self._call_gemini(
+                messages=self.conversation_history + [{"role": "user", "content": user_message}],
+                system_prompt=conclusion_prompt,
+            )
+            if "Council of Experts" not in response:
+                response = (response.rstrip() +
+                    " Click the **Council of Experts** button below to see the full analysis.")
+            self.conversation_history.append({"role": "user",      "content": user_message})
+            self.conversation_history.append({"role": "assistant",  "content": response})
+            return response
+
+        # Normal conversational turn
+        print(f"[TURN {self.turn_count}] Collecting info about '{opt_a}' vs '{opt_b}'")
+
+        # Detect subtype FIRST — everything below depends on it
+        subtype = state_dict.get("decision_metadata", {}).get("decision_subtype", "general")
+
+        # Map generic option labels to natural language.
+        # 'Continue Job' / 'Keep Job' -> 'your job'
+        # 'Pursue Passion' / 'Start Business' -> 'your passion' / 'your business idea'
+        GENERIC_JOB_LABELS = {
+            "continue job", "keep job", "stay at job", "current job",
+            "job", "stay", "my job", "the job",
+        }
+        GENERIC_PASSION_LABELS = {
+            "pursue passion", "follow passion", "passion", "my passion",
+            "start business", "start a business", "entrepreneurship",
+            "quit job", "leave job", "the business", "new career",
+        }
+        def natural(label):
+            ll = label.lower().strip()
+            if ll in GENERIC_JOB_LABELS:     return "your current job"
+            if ll in GENERIC_PASSION_LABELS: return "your passion"
+            return label
+
+        # Detect if this is semantically a job-vs-passion decision even if subtype is wrong
+        is_jvb = (
+            subtype == "job_vs_business" or
+            (opt_a.lower() in GENERIC_JOB_LABELS | GENERIC_PASSION_LABELS or
+             opt_b.lower() in GENERIC_JOB_LABELS | GENERIC_PASSION_LABELS)
+        )
+        if is_jvb:
+            label_a = natural(opt_a)
+            label_b = natural(opt_b)
+            subtype = "job_vs_business"   # normalise subtype for topic selection
         else:
-            return self._generate_general_debate(state_dict)
+            label_a = opt_a
+            label_b = opt_b
+
+
+        if subtype == "university_comparison":
+            topics = f"""
+DECISION TYPE: University comparison — {opt_a} vs {opt_b}.
+The user is choosing between these two universities. Cover ALL of these topics — one per turn, in roughly this order:
+
+FINANCIAL (ask early — but PIVOT IMMEDIATELY if user says money doesn't matter):
+  1. In-state or out-of-state for each school? (one question, not two)
+  2. Any scholarships or financial aid offered?
+  3. Expected salary target after graduating?
+  4. Rough living cost awareness — but ONLY if they seem financially aware. If they say "I don't know" or "doesn't matter", skip to ACADEMIC section immediately.
+
+IMPORTANT: If user says "I don't care about money" or gives a very low financial priority, stop ALL financial questions and move to ACADEMIC section right away.
+
+ACADEMIC & CAREER:
+  5. Major / specialization — what specific area within their field? (ask early if not known)
+  6. Program reputation — which school is known for their specific field? Does name matter?
+  7. Research vs coursework — do they want to do research or just complete coursework?
+  8. Job market after graduation — do they want to work in the same city or relocate?
+
+PERSONAL:
+  9. Social / support system — anyone near either campus? Friends, family?
+  10. City preference — lifestyle fit (big city, small town, weather, campus environment)
+  11. Timeline — do they need to finish quickly or is a longer program okay?
+  12. Biggest concern — what would make this the wrong choice?
+
+Do NOT ask all at once. One question per turn. Start with financial questions since those have the most impact on the analysis.
+Do NOT ask about major if they already told you."""
+        elif subtype == "offer_comparison":
+            topics = f"""
+DECISION TYPE: Job offer comparison — {opt_a} vs {opt_b}.
+Cover these topics naturally:
+  • Role and day-to-day work at each — what would they actually be doing?
+  • Salary and total compensation at each
+  • Relocation — does either require moving? Is that feasible?
+  • Growth potential at each company
+  • Team and culture fit
+  • Work-life balance expectations
+  • Family / personal constraints
+  • Their biggest concern about each offer"""
+        elif subtype == "job_vs_business":
+            topics = (
+                "DECISION TYPE: Job vs passion/business.\n"
+                "Cover these topics naturally, one per turn:\n"
+                "- What IS the passion/business idea -- what would they actually do? (ask early)\n"
+                "- Have they tested it -- customers, side income, any validation?\n"
+                "- Current job satisfaction -- fleeing frustration or chasing something real?\n"
+                "- Current salary and monthly expenses\n"
+                "- Savings/financial runway -- how many months without income?\n"
+                "- Family or dependents who rely on their income?\n"
+                "- Partner employed? Second income in the household?\n"
+                "- Worst-case scenario they can live with?\n"
+                "- Biggest fear about making the leap"
+            )
+        elif subtype == "education_path":
+            topics = (
+                f"DECISION TYPE: Education path -- {opt_a} vs {opt_b}.\n"
+                "Cover these topics naturally:\n"
+                "- Current situation -- what is pushing toward further study?\n"
+                "- Financial situation -- can they afford reduced income during study?\n"
+                "- What specific role does this path lead to?\n"
+                "- Do they genuinely enjoy research, or just want the credential?\n"
+                "- Family obligations -- partner, dependents, location constraints\n"
+                "- What draws them to each option specifically\n"
+                "- Biggest concern about the wrong choice"
+            )
+        elif subtype == "major_choice":
+            topics = f"""
+DECISION TYPE: Academic field / major choice — {opt_a} vs {opt_b}.
+The user is choosing between two fields of study. These questions separate a good analysis from a generic one.
+
+Ask these in order — one per turn:
+
+INTERESTS (most important — ask early):
+  1. What specifically excites them about {opt_a}? Push past "I like it" to concrete activities.
+  2. What specifically excites them about {opt_b}? Same — concrete.
+  3. Day-to-day work preference: do they prefer building/coding, analysing data/patterns, doing research, or managing systems? Be specific to {opt_a} vs {opt_b}.
+  4. Math and statistics comfort — relevant for differentiating these fields.
+
+FINANCIAL:
+  5. How important is salary — ask for a 1-10 rating. This drives agent weighting.
+  6. Do they have debt or financial pressure that makes earning potential critical?
+
+CAREER VISION:
+  7. What specific job title or role in 3-5 years? "Team lead" or "data scientist" or "software engineer" — get concrete.
+  8. Industry preference — tech company, finance, healthcare, research, startup?
+
+PERSONAL:
+  9. Do they have a natural lean toward one field, and if so why?
+  10. Biggest concern about choosing the wrong one — missing out on opportunities, ending up bored, salary risk?
+
+CRITICAL RULES for this decision type:
+- Do NOT ask about relocation or family early — those matter less for a field choice.
+- DO ask about what kind of work energizes them — this is the #1 differentiator.
+- Reference {opt_a} and {opt_b} by name in every question."""
+
+        else:
+            topics = f"""
+Cover these topics naturally across the conversation:
+  • Financial situation — salary importance (ask 1-10), debt, savings pressures
+  • Career goals — role, level, kind of work in 3-5 years
+  • Work style — what kind of daily work energizes them day-to-day
+  • What specifically draws them toward {opt_a} vs {opt_b}
+  • Personal constraints — family, location, partner
+  • Risk tolerance — stability vs upside
+  • Their biggest concern about the wrong choice"""
+
+        system_prompt = f"""You are a brutally direct, no-nonsense decision analyst. You help people cut through their own BS and figure out what they actually want.
+
+Personality: Blunt. Occasionally sarcastic. Funny when it fits. You call out vague or evasive answers immediately. You are not mean -- you are the friend who tells people what they need to hear, not what they want to hear.
+
+You are helping someone decide between {label_a} and {label_b}.
+{topics}
+
+This is turn {self.turn_count} (max 15, but will stop early when financial + career + personal data is collected).
+{"EARLY — prioritise: what they study, financial situation, career goal." if self.turn_count <= 4 else ""}
+{"MID — fill gaps. Push back on vague answers. Still need: work style, personal constraints, concerns." if 5 <= self.turn_count <= 9 else ""}
+{"NEAR END — cover anything critical still missing. Be direct and efficient." if self.turn_count >= 10 else ""}
+
+RULES -- follow exactly:
+1. Ask ONE question per turn. Never two.
+2. Keep it conversational -- 2-4 sentences max. One reaction, one question.
+3. Questions should be direct and specific -- no more than 20 words.
+4. If they give a vague non-answer ("I don't know", "I like it", "it interests me"):
+   - Try ONE more specific follow-up on the same topic.
+   - If they still don't know or don't care, MOVE ON to the next topic. Never ask the same thing a third time.
+5. PIVOT RULE — if the user signals a topic doesn't matter to them ("I don't care about money", "doesn't matter", "I don't know and don't care"):
+   - Acknowledge it in one sentence ("Got it, money's not the priority here.")
+   - Immediately move to a DIFFERENT topic area. Do NOT keep asking about the dismissed topic.
+   - This is critical for university comparisons: if they don't care about cost, ask about program reputation, campus life, career goals instead.
+6. NEVER tell the user to "do research and come back" or "look something up". If they don't know a number, move on.
+7. When someone reveals something specific, run with it immediately.
+8. Refer to the options as "{label_a}" and "{label_b}" -- never as generic "option A".
+9. Do NOT give advice -- the council handles recommendations.
+10. Do NOT volunteer information about the options (rankings, reputation, job markets, costs).
+    You collect facts from the USER. You do not provide facts about the options.
+    WRONG: "UMBC has a strong CS program in the Mid-Atlantic..."
+    RIGHT: "How important is program reputation to you for your AI career?"
+11. Do NOT dismiss relevant answers. Salary target is always relevant.
+12. Drop all sycophancy. No "Great!", "That's interesting!", "Good to know!".{violation_note}"""
+
+        messages = self.conversation_history + [{"role": "user", "content": user_message}]
+        response = self._call_gemini(messages=messages, system_prompt=system_prompt)
+        self.conversation_history.append({"role": "user",      "content": user_message})
+        self.conversation_history.append({"role": "assistant",  "content": response})
+        return response
+
+
+
+    def _build_symbolic_constraints_block(self, state_dict: Dict) -> str:
+        """
+        Build the SYMBOLIC ENGINE CONSTRAINTS section from the reasoning trace.
+        Injected into every agent and synthesizer prompt so the LLM layer
+        must respect deterministic rule outputs, not reason around them.
+        """
+        trace      = state_dict.get("reasoning_trace", {})
+        fired      = trace.get("fired_rules", [])
+        mode_info  = trace.get("decision_mode", {})
+        rule_counts = trace.get("rule_counts", {})
+
+        if not fired and not mode_info:
+            return ""
+
+        mode_str  = mode_info.get("mode", "UNKNOWN")
+        mode_rule = mode_info.get("rule_id", "")
+        mode_expl = mode_info.get("explanation", "")
+        n_total   = rule_counts.get("total_registered", "?")
+        n_fired   = rule_counts.get("fired", len(fired))
+
+        lines = [
+            "",
+            "=" * 60,
+            "SYMBOLIC ENGINE CONSTRAINTS",
+            f"(Deterministic rule evaluation: {n_fired}/{n_total} rules fired)",
+            "=" * 60,
+            f"Decision Mode: {mode_str}  [{mode_rule}]",
+            f"Mode reason:   {mode_expl}",
+            "",
+        ]
+
+        if not fired:
+            lines.append("No constraint violations detected.")
+        else:
+            critical = [r for r in fired if r.get("severity") == "critical"]
+            warnings = [r for r in fired if r.get("severity") == "warning"]
+            info     = [r for r in fired if r.get("severity") == "info"]
+
+            if critical:
+                lines.append("CRITICAL VIOLATIONS — hard structural incompatibilities.")
+                lines.append("  Your analysis MUST acknowledge these.")
+                for r in critical:
+                    lines.append(f"  [{r['rule_id']}] {r['rule_name']}")
+                    lines.append(f"  -> {r['conclusion']}")
+                    facts_str = ", ".join(
+                        f"{k.split('.')[-1]}={v}"
+                        for k, v in r.get("triggering_facts", {}).items()
+                    )
+                    if facts_str:
+                        lines.append(f"  Triggering facts: {facts_str}")
+                    lines.append("")
+
+            if warnings:
+                lines.append("WARNINGS — tensions to weigh:")
+                for r in warnings:
+                    lines.append(f"  [{r['rule_id']}] {r['rule_name']}")
+                    lines.append(f"  -> {r['conclusion']}")
+                    lines.append("")
+
+            if info:
+                lines.append("INFO:")
+                for r in info:
+                    lines.append(f"  [{r['rule_id']}] {r['conclusion']}")
+
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
+    # ── Profile builder ───────────────────────────────────────────────────────────
 
     def _build_profile(self, state_dict: Dict) -> str:
+        """
+        Build the user profile section for LLM prompts.
+        Appends the symbolic constraints block so agents see both facts
+        and deterministic rule outputs in every prompt.
+        """
         interests  = state_dict.get("interests", {})
         career_vis = state_dict.get("career_vision", {})
         strengths  = state_dict.get("strengths", {})
@@ -964,13 +980,12 @@ RULES:
         personal   = state_dict.get("personal", {})
         options    = state_dict.get("decision_metadata", {}).get("options_being_compared", ["Option A", "Option B"])
         subtype    = state_dict.get("decision_metadata", {}).get("decision_subtype", "general")
-        violations = self._get_active_violations(state_dict)
 
         opt_a = options[0] if options else "Option A"
         opt_b = options[1] if len(options) > 1 else "Option B"
 
         if subtype == "offer_comparison":
-            profile = f"""User is comparing two job offers:
+            facts_section = f"""User is comparing two job offers:
 
 {opt_a}:
 {json.dumps({k:v for k,v in offer_a.items() if v is not None and v != ""}, indent=2)}
@@ -985,7 +1000,19 @@ Their values and priorities:
 {json.dumps({k:v for k,v in values.items() if v is not None}, indent=2)}"""
 
         elif subtype == "university_comparison":
-            profile = f"""User is comparing two universities:
+            college_note = ""
+            if hasattr(self, "_college") and self._college:
+                try:
+                    cards = self._college.get_cards_for_decision(opt_a, opt_b)
+                    ca, cb = cards.get("option_a"), cards.get("option_b")
+                    if ca or cb:
+                        college_note = "\n" + self._college.format_comparison_block(
+                            ca, cb, opt_a, opt_b
+                        )
+                except Exception:
+                    pass
+
+            facts_section = f"""User is comparing two universities:
 
 {opt_a}:
 {json.dumps({k:v for k,v in uni_a.items() if v is not None and v != ""}, indent=2)}
@@ -997,13 +1024,13 @@ Personal / life context:
 {json.dumps({k:v for k,v in personal.items() if v is not None and v != ""}, indent=2)}
 
 Their values and priorities:
-{json.dumps({k:v for k,v in values.items() if v is not None}, indent=2)}"""
+{json.dumps({k:v for k,v in values.items() if v is not None}, indent=2)}{college_note}"""
 
         elif subtype == "major_choice":
-            profile = f"""User is choosing between {opt_a} and {opt_b} for their degree.
+            facts_section = f"""User is choosing between {opt_a} and {opt_b} for their degree.
 
 Current situation:
-{json.dumps({k:v for k,v in current.items()   if v is not None and v != ""}, indent=2)}
+{json.dumps({k:v for k,v in current.items() if v is not None and v != ""}, indent=2)}
 
 Interests and work style:
 {json.dumps({k:v for k,v in interests.items() if v is not None and v is not False}, indent=2)}
@@ -1012,264 +1039,243 @@ Career vision:
 {json.dumps({k:v for k,v in career_vis.items() if v is not None and v != ""}, indent=2)}
 
 Values and priorities:
-{json.dumps({k:v for k,v in values.items()    if v is not None}, indent=2)}"""
+{json.dumps({k:v for k,v in values.items() if v is not None}, indent=2)}"""
 
         elif subtype == "job_vs_business":
-            profile = f"""User is deciding whether to leave their job and start a business.
+            facts_section = f"""User is deciding whether to leave their job and start a business.
 
 Current situation:
-{json.dumps({k:v for k,v in current.items()   if v is not None and v != ""}, indent=2)}
+{json.dumps({k:v for k,v in current.items() if v is not None and v != ""}, indent=2)}
 
 Personal / family context:
-{json.dumps({k:v for k,v in personal.items()  if v is not None and v != ""}, indent=2)}
+{json.dumps({k:v for k,v in personal.items() if v is not None and v != ""}, indent=2)}
 
 Values and priorities:
-{json.dumps({k:v for k,v in values.items()    if v is not None}, indent=2)}"""
+{json.dumps({k:v for k,v in values.items() if v is not None}, indent=2)}"""
 
         else:
-            profile = f"""User profile (facts from conversation):
-- Interests:      {json.dumps({k:v for k,v in interests.items()  if v is not None and v is not False})}
-- Values:         {json.dumps({k:v for k,v in values.items()     if v is not None})}
+            facts_section = f"""User profile (facts from conversation):
+- Interests:      {json.dumps({k:v for k,v in interests.items() if v is not None and v is not False})}
+- Values:         {json.dumps({k:v for k,v in values.items() if v is not None})}
 - Career vision:  {json.dumps({k:v for k,v in career_vis.items() if v is not None and v != ""})}
-- Financial:      {json.dumps({k:v for k,v in financial.items()  if v is not None})}
-- Strengths:      {json.dumps({k:v for k,v in strengths.items()  if v is not None})}
-- Current:        {json.dumps({k:v for k,v in current.items()    if v is not None})}"""
+- Financial:      {json.dumps({k:v for k,v in financial.items() if v is not None})}
+- Strengths:      {json.dumps({k:v for k,v in strengths.items() if v is not None})}
+- Current:        {json.dumps({k:v for k,v in current.items() if v is not None})}"""
 
-        if violations:
-            profile += f"\n\nNoted contradictions: {violations}"
+        symbolic_block = self._build_symbolic_constraints_block(state_dict)
+        return facts_section + symbolic_block
 
-        return profile
-
-    def _run_agent_debate(self, state_dict: Dict, options: List[str]) -> Dict:
+    # ── Council debate (4 fixed agents) ──────────────────────────────────────
+    def generate_council_perspectives(self, state_dict: Dict) -> Dict:
         """
-        Each agent:
-        1. Analyzes profile from their lens
-        2. Casts a vote (option_a %, option_b %) with 2-3 sentence reasoning
-        3. Round 2: agents with opposing votes debate each other (2-3 sentences)
-        4. Round 3 (adaptive): only if vote split is close (within 20 points)
-        5. Synthesizer tallies weighted votes and rules
-        """
-        option_a, option_b = options[0], options[1]
-        profile = self._build_profile(state_dict)
-        results = {}
+        Run 4 independent expert analyses — no debate rounds.
 
-        # ── Round 1: Each agent votes ─────────────────────────────────────────
-        agent_votes = {}  # agent_id -> {"option_a": X, "option_b": Y, "text": "..."}
+        Each agent gets:
+          - Full user profile
+          - BLS career data for both options
+          - Symbolic engine constraints
+          - Explicit instructions to cite specific numbers and respect user's stated lean
+
+        The synthesizer reads all 4 analyses, respects the symbolic constraints,
+        cites BLS data, and produces a direction + open question.
+
+        Works for ALL decision types, not just career_choice/education.
+        """
+        options  = state_dict.get("decision_metadata", {}).get("options_being_compared", [])
+        opt_a    = options[0] if len(options) > 0 else "Option A"
+        opt_b    = options[1] if len(options) > 1 else "Option B"
+
+        # Count meaningful facts — warn agents if data is thin
+        total_facts = sum(
+            1 for cat in ["values","interests","career_vision","current","personal","financial",
+                          "offer_a","offer_b","uni_a","uni_b"]
+            for v in state_dict.get(cat, {}).values()
+            if v is not None and v is not False and v != "" and v != []
+        )
+        thin_data_warning = ""
+        if total_facts < 5:
+            thin_data_warning = (
+                f"\n\nDATA WARNING: Only {total_facts} meaningful facts were collected "
+                f"from the conversation. The analysis below is based on limited information. "
+                f"Do NOT invent facts, assume demographics, or hallucinate specifics about "
+                f"{opt_a} or {opt_b}. If you don't have the data to evaluate something, say so."
+            )
+        print(f"[COUNCIL] Facts collected: {total_facts}")
+
+        profile  = self._build_profile(state_dict)
+
+        # Data lookup — BLS for career/job, College Scorecard for university comparisons
+        bls_block    = ""
+        options_list = state_dict.get("decision_metadata", {}).get("options_being_compared", [])
+        subtype_str  = state_dict.get("decision_metadata", {}).get("decision_subtype", "")
+
+        if subtype_str == "university_comparison" and hasattr(self, "_college") and self._college and len(options_list) >= 2:
+            try:
+                qa, qb = options_list[0], options_list[1]
+                cards  = self._college.get_cards_for_decision(qa, qb)
+                ca, cb = cards.get("option_a"), cards.get("option_b")
+                if ca or cb:
+                    bls_block = self._college.format_comparison_block(ca, cb, qa, qb)
+                    print(f"[COLLEGE] Injected scorecard data for {qa} vs {qb}")
+            except Exception as e:
+                print(f"[COLLEGE] Lookup failed: {e}")
+
+        elif self._bls and len(options_list) >= 2:
+            try:
+                qa, qb = options_list[0], options_list[1]
+                if subtype_str == "offer_comparison":
+                    qa = (state_dict.get("offer_a", {}).get("role") or qa).strip()
+                    qb = (state_dict.get("offer_b", {}).get("role") or qb).strip()
+                cards = self._bls.get_cards_for_decision(qa, qb)
+                ca, cb = cards.get("option_a"), cards.get("option_b")
+                if ca or cb:
+                    bls_block = self._bls.format_comparison_block(ca, cb, qa, qb)
+            except Exception as e:
+                print(f"[BLS] Lookup failed: {e}")
+
+        results  = {}
+
+        # ── Run 4 independent agent analyses ─────────────────────────────────────
+        agent_votes = {}   # agent_id -> {"option_a": X, "option_b": Y}
+        user_lean   = state_dict.get("current", {}).get("leaning") or ""
+
+        # Compact violation summary for agents
+        trace = state_dict.get("reasoning_trace", {})
+        fired = trace.get("fired_rules", [])
+        critical_rules = [r for r in fired if r.get("severity") == "critical"]
+        violation_summary = ""
+        if critical_rules:
+            violation_summary = "\nCRITICAL CONSTRAINTS:\n" + "\n".join(
+                f"  [{r['rule_id']}] {r['conclusion']}" for r in critical_rules
+            )
+
+        # Build compact violation note for agents
+        trace = state_dict.get("reasoning_trace", {})
+        crit  = [r for r in trace.get("fired_rules", []) if r.get("severity") == "critical"]
+        viol_note = (" CRITICAL: " + "; ".join(r["conclusion"] for r in crit)) if crit else ""
 
         for agent in self.AGENTS:
-            prompt = f"""{profile}
+            prompt = (
+                f"{profile}\n{bls_block}\n"
+                f"You are the {agent['name']} ({agent['emoji']}).\n"
+                f"Lens: {agent['lens']}\n"
+                f"FORBIDDEN: {agent['forbidden']}\n"
+                f"Must address: {agent['must_ask']}\n"
+                f"Decision: {opt_a} vs {opt_b}{viol_note}"
+                f"{'  User lean: ' + str(user_lean) if user_lean else ''}"
+                f"{thin_data_warning}\n\n"
+                f"CRITICAL INSTRUCTIONS:\n"
+                f"- Read the user profile above carefully. Every answer they gave is a signal.\n"
+                f"- Connect SPECIFIC answers to SPECIFIC conclusions. Not generic analysis.\n"
+                f"- If BLS data is above, use exact numbers. '$131,450 vs $112,590' not 'higher salary'.\n"
+                f"- If the user gave a strong signal (10/10 salary priority, hands-on work, team lead goal), build your argument around THAT.\n"
+                f"- Do NOT give balanced 'on one hand / on the other hand' analysis. Pick a direction and argue for it from your lens.\n"
+                f"- 3 sentences max in ANALYSIS. Make every sentence count.\n\n"
+                f"Respond EXACTLY:\n"
+                f"LEAN: {opt_a}: [X]% | {opt_b}: [Y]%\n"
+                f"ANALYSIS: [3 sharp sentences — your lens only, cite the user's specific answers and BLS numbers]\n"
+                f"KEY INSIGHT: [1 sentence that someone reading this would actually remember]\n\n"
+                f"X+Y=100. No hedging. Argue your lens."
+            )
+            raw = self._call_llm(
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=550,
+            )
+            results[f"agent_{agent['id']}"] = raw
 
-You are the {agent['name']} ({agent['emoji']}).
-Your analytical lens: {agent['lens']}
-
-The decision: {option_a} vs {option_b}
-
-From YOUR specific lens only:
-1. Cast your vote as a percentage split — e.g. "{option_a}: 70%, {option_b}: 30%"
-2. Explain your vote in 2-3 sentences, citing specific facts from the profile
-3. Name the single most important factor from your lens that swings this
-
-Format your response EXACTLY like this:
-VOTE: {option_a}: [X]% | {option_b}: [Y]%
-REASONING: [2-3 sentences]
-KEY FACTOR: [one phrase]
-
-Rules:
-- X + Y = 100
-- Stay strictly within your lens — don't comment on things outside it
-- Be direct and specific, not generic"""
-
-            raw = self._call_gemini(messages=[{"role": "user", "content": prompt}])
-            results[f"agent_{agent['id']}_round1"] = raw
-
-            # Parse vote
-            vote_a, vote_b = 50, 50  # defaults
+            # Parse lean percentages from LEAN: X% | Y% line
+            vote_a, vote_b = 50, 50
             try:
                 for line in raw.split("\n"):
-                    if line.startswith("VOTE:"):
-                        parts = line.replace("VOTE:", "").strip()
-                        # e.g. "PhD: 30% | Job: 70%"
-                        segs = parts.split("|")
+                    if line.strip().upper().startswith("LEAN:"):
+                        parts = line.split(":", 1)[1].strip()
+                        segs  = parts.split("|")
                         if len(segs) == 2:
-                            vote_a = int(''.join(c for c in segs[0].split(":")[-1] if c.isdigit()))
-                            vote_b = int(''.join(c for c in segs[1].split(":")[-1] if c.isdigit()))
+                            vote_a = int("".join(c for c in segs[0].split(":")[-1] if c.isdigit()))
+                            vote_b = int("".join(c for c in segs[1].split(":")[-1] if c.isdigit()))
             except Exception as e:
                 print(f"[VOTE PARSE] {agent['id']}: {e}")
 
             agent_votes[agent["id"]] = {"option_a": vote_a, "option_b": vote_b, "raw": raw}
-            print(f"[VOTE] {agent['name']}: {option_a}={vote_a}% {option_b}={vote_b}%")
+            print(f"[VOTE] {agent['name']}: {opt_a}={vote_a}% {opt_b}={vote_b}%")
 
         results["agent_votes"] = agent_votes
 
-        # ── Tally after Round 1 ───────────────────────────────────────────────
-        total_a = sum(v["option_a"] for v in agent_votes.values())
-        total_b = sum(v["option_b"] for v in agent_votes.values())
-        avg_a   = total_a / len(self.AGENTS)
-        avg_b   = total_b / len(self.AGENTS)
-        spread  = abs(avg_a - avg_b)
+        # ── Aggregate vote ────────────────────────────────────────────────────
+        avg_a = sum(v["option_a"] for v in agent_votes.values()) / len(self.AGENTS)
+        avg_b = sum(v["option_b"] for v in agent_votes.values()) / len(self.AGENTS)
         results["tally_after_r1"] = {"option_a": round(avg_a), "option_b": round(avg_b)}
+        print(f"[TALLY] {opt_a}={avg_a:.0f}% {opt_b}={avg_b:.0f}%")
 
-        print(f"[TALLY R1] {option_a}={avg_a:.0f}% {option_b}={avg_b:.0f}% spread={spread:.0f}")
+        # ── Synthesizer ───────────────────────────────────────────────────────
+        analyses_parts = []
+        for ag in self.AGENTS:
+            key = f"agent_{ag['id']}"
+            analyses_parts.append(f"{ag['name']} ({ag['emoji']}):\n{results.get(key, 'N/A')}")
+        analyses_block = "\n\n".join(analyses_parts)
 
-        # ── Round 2: Opposing agents debate ──────────────────────────────────
-        # Find the agent most for A and the agent most for B
-        top_a_agent = max(self.AGENTS, key=lambda ag: agent_votes[ag["id"]]["option_a"])
-        top_b_agent = max(self.AGENTS, key=lambda ag: agent_votes[ag["id"]]["option_b"])
+        trace        = state_dict.get("reasoning_trace", {})
+        fired_rules  = trace.get("fired_rules", [])
+        mode_info    = trace.get("decision_mode", {})
+        mode_str     = mode_info.get("mode", "UNKNOWN")
+        critical_txt = ""
+        if fired_rules:
+            critical = [r for r in fired_rules if r.get("severity") == "critical"]
+            if critical:
+                critical_txt = "CRITICAL CONSTRAINTS (MUST acknowledge in ruling):\n"
+                for r in critical:
+                    critical_txt += f"  [{r['rule_id']}] {r['conclusion']}\n"
 
-        if top_a_agent["id"] != top_b_agent["id"]:
-            # Top-A agent rebuts top-B agent's Round 1 argument
-            r2a_prompt = f"""{profile}
+        lean_instruction = ""
+        if user_lean:
+            lean_instruction = (
+                f"\nIMPORTANT: Person explicitly leans toward: \"{user_lean}\"\n"
+                "Mental Wellbeing Agent gives this significant weight. Ruling must address "
+                "whether data supports or conflicts with this stated preference."
+            )
 
-You are the {top_a_agent['name']} ({top_a_agent['emoji']}).
-Your lens: {top_a_agent['lens']}
-
-The {top_b_agent['name']} just argued:
-"{results[f"agent_{top_b_agent['id']}_round1"]}"
-
-Rebuttal (2-3 sentences max):
-- Attack ONE specific weakness in their argument from your lens
-- Reinforce your case for {option_a}
-- Be sharp and direct
-- Do NOT start with "I" """
-
-            results["round2_a"] = self._call_gemini(messages=[{"role": "user", "content": r2a_prompt}])
-
-            # Top-B agent rebuts top-A agent's Round 1 argument
-            r2b_prompt = f"""{profile}
-
-You are the {top_b_agent['name']} ({top_b_agent['emoji']}).
-Your lens: {top_b_agent['lens']}
-
-The {top_a_agent['name']} just argued:
-"{results[f"agent_{top_a_agent['id']}_round1"]}"
-
-Rebuttal (2-3 sentences max):
-- Attack ONE specific weakness in their argument from your lens
-- Reinforce your case for {option_b}
-- Be sharp and direct
-- Do NOT start with "I" """
-
-            results["round2_b"] = self._call_gemini(messages=[{"role": "user", "content": r2b_prompt}])
-            results["debating_agents"] = {
-                "a": {"name": top_a_agent["name"], "emoji": top_a_agent["emoji"], "option": option_a},
-                "b": {"name": top_b_agent["name"], "emoji": top_b_agent["emoji"], "option": option_b},
-            }
-        else:
-            results["round2_a"] = ""
-            results["round2_b"] = ""
-            results["debating_agents"] = {}
-
-        # ── Round 3 (adaptive): only if spread <= 20 ─────────────────────────
-        results["has_round3"] = False
-        if spread <= 20 and top_a_agent["id"] != top_b_agent["id"]:
-            print(f"[ROUND 3] Close vote ({spread:.0f} pt spread), triggering Round 3")
-            results["has_round3"] = True
-
-            r3a_prompt = f"""{profile}
-
-ROUND 3 — Final argument. You are the {top_a_agent['name']} ({top_a_agent['emoji']}).
-
-Your opponent ({top_b_agent['name']}) just said in Round 2:
-"{results['round2_b']}"
-
-Give your FINAL, decisive argument for {option_a}. This is your closing statement.
-- Address their Round 2 rebuttal directly
-- Make your single strongest point
-- 2-3 sentences, no more
-- Do NOT start with "I" """
-
-            results["round3_a"] = self._call_gemini(messages=[{"role": "user", "content": r3a_prompt}])
-
-            r3b_prompt = f"""{profile}
-
-ROUND 3 — Final argument. You are the {top_b_agent['name']} ({top_b_agent['emoji']}).
-
-Your opponent ({top_a_agent['name']}) just said in Round 3:
-"{results['round3_a']}"
-
-Give your FINAL, decisive argument for {option_b}. This is your closing statement.
-- Address their Round 3 argument directly
-- Make your single strongest point
-- 2-3 sentences, no more
-- Do NOT start with "I" """
-
-            results["round3_b"] = self._call_gemini(messages=[{"role": "user", "content": r3b_prompt}])
-
-        # ── Synthesizer: reads all rounds, tallies, rules ─────────────────────
-        all_rounds = f"""Round 1 votes:
-{chr(10).join(f"  {ag['name']}: {agent_votes[ag['id']]['raw']}" for ag in self.AGENTS)}
-
-Round 2 debate:
-  {results.get('debating_agents', {}).get('a', {}).get('name', 'Agent A')}: {results.get('round2_a', 'N/A')}
-  {results.get('debating_agents', {}).get('b', {}).get('name', 'Agent B')}: {results.get('round2_b', 'N/A')}"""
-
-        if results["has_round3"]:
-            all_rounds += f"""
-
-Round 3 (tiebreaker):
-  {results.get('debating_agents', {}).get('a', {}).get('name', 'Agent A')}: {results.get('round3_a', 'N/A')}
-  {results.get('debating_agents', {}).get('b', {}).get('name', 'Agent B')}: {results.get('round3_b', 'N/A')}"""
-
-        synth_prompt = f"""{profile}
-
-The 4 agents just debated {option_a} vs {option_b}:
-{all_rounds}
-
-Weighted vote tally after Round 1:
-  {option_a}: AVG_A_PCT% average across all agents
-  {option_b}: AVG_B_PCT% average across all agents
-
-You are the SYNTHESIZER. Rule on this debate.
-
-Write your ruling in this format:
-WINNING ARGUMENT: [Name the single strongest argument from any agent in any round, and why]
-WEAKEST ARGUMENT: [Name the weakest argument, and why]
-VOTE TALLY: {option_a} AVG_A_PCT% | {option_b} AVG_B_PCT%
-RULING: [2-3 sentences — state which option the profile leans toward based on the weighted vote, and explain the single deciding factor clearly]
-OPEN QUESTION: [One genuine unresolved question about the decision that the user should reflect on — NOT life advice, NOT "research X", NOT "talk to Y". Something like "The key tension here is whether financial stability now outweighs career fulfillment later — which matters more to you?"]
-
-RULES:
-- Do NOT say "you should"
-- Use "the data suggests..." or "the profile leans toward..."
-- Do NOT start with "I"
-- Be decisive — if it's close, say so but still lean one way
-- OPEN QUESTION must be a genuine dilemma question, NOT an action item or advice
-- Do NOT suggest researching programs, networking, talking to advisors, or any external action"""
-
-        synth_prompt = synth_prompt.replace("AVG_A_PCT", str(round(avg_a)))
-        synth_prompt = synth_prompt.replace("AVG_B_PCT", str(round(avg_b)))
-
-        results["synthesizer"] = self._call_gemini(
-            messages=[{"role": "user", "content": synth_prompt}]
+        synth_prompt = (
+            f"{profile}\n\n"
+            f"{bls_block}\n\n"
+            f"3 expert agents analyzed {opt_a} vs {opt_b}:{thin_data_warning}\n\n"
+            f"{analyses_block}\n\n"
+            f"Aggregate lean: {opt_a}: {round(avg_a)}% | {opt_b}: {round(avg_b)}%\n"
+            f"Decision Mode: {mode_str}\n"
+            f"{critical_txt}"
+            f"{lean_instruction}\n\n"
+            "You are the SYNTHESIZER. Produce a clear ruling.\n\n"
+            "Format EXACTLY:\n"
+            "STRONGEST ANALYSIS: [which agent was most specific and why]\n"
+            "WEAKEST ANALYSIS: [which agent was most generic and why]\n"
+            f"VOTE TALLY: {opt_a} {round(avg_a)}% | {opt_b} {round(avg_b)}%\n"
+            "RULING: [2-3 sentences — which option the full picture leans toward; cite at least one specific fact]\n"
+            "OPEN QUESTION: [one genuine unresolved dilemma for the person to reflect on]\n\n"
+            "HARD RULES:\n"
+            "- Use 'the data suggests...' or 'the profile leans toward...'\n"
+            "- Do NOT say 'you should'\n"
+            "- RULING must cite at least one number or named constraint\n"
+            "- OPEN QUESTION must be a genuine either/or dilemma\n"
+            "- CONTRADICTION CHECK: if College Scorecard or BLS data points one way "
+            "but the agent votes point the opposite way, you MUST flag this explicitly "
+            "in the RULING with: 'Note: external data suggests X but agent analyses lean Y — "
+            "this may reflect data gaps rather than a genuine recommendation.'"
         )
 
-        # Store summary data for rendering
-        results["options"]  = [option_a, option_b]
-        results["avg_vote"] = {"option_a": round(avg_a), "option_b": round(avg_b)}
-        results["agents"]   = self.AGENTS
-
+        results["synthesizer"]  = self._call_llm(
+            messages=[{"role": "user", "content": synth_prompt}],
+            max_tokens=650,
+        )
+        results["options"]         = [opt_a, opt_b]
+        results["avg_vote"]        = {"option_a": round(avg_a), "option_b": round(avg_b)}
+        results["agents"]          = self.AGENTS
+        results["has_round3"]      = False
+        results["round2_a"]        = ""
+        results["round2_b"]        = ""
+        results["debating_agents"] = {}
         return results
 
-    def _generate_general_debate(self, state_dict: Dict) -> Dict:
-        context = json.dumps(state_dict, indent=2, default=str)
-        perspectives = {}
-        for role, focus in [
-            ("risk",        "risks, worst-case scenarios, missing safety nets"),
-            ("opportunity", "upside potential, growth, what could go right"),
-            ("values",      "alignment with stated values, identity, authenticity"),
-        ]:
-            perspectives[role] = self._call_gemini(messages=[{"role": "user", "content":
-                f"""Decision state:\n{context}\n\nYou are the {role.upper()} ANALYST.
-Focus on: {focus}
-- Reference specific facts
-- 4-5 sentences max
-- Do NOT start with "I" """}])
-        return perspectives
 
     def reset_conversation(self):
         self.conversation_history = []
-        self.asked_topics = {}
-
-
-if __name__ == "__main__":
-    print("LLM Interface ready.")
+        self.turn_count = 0
+        self._current_model_idx = 0   # reset to primary model for new conversation
