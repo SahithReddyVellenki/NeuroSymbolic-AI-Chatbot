@@ -3,6 +3,7 @@ Decision Support System - Main Application
 Streamlit interface for the hybrid neuro-symbolic decision support system
 """
 
+import logging
 import streamlit as st
 import streamlit.components.v1 as components
 import os
@@ -13,10 +14,9 @@ import json
 # ── API key ────────────────────────────────────────────────────────────────────
 # Try Groq key from secrets; fall back to env var for local dev
 try:
-    GOOGLE_API_KEY = st.secrets["GROQ_API_KEY"]
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
 except Exception:
-    import os
-    GOOGLE_API_KEY = os.getenv("GROQ_API_KEY", "")
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -36,30 +36,30 @@ if "messages" not in st.session_state:
 if "show_council" not in st.session_state:
     st.session_state.show_council = False
 if "chat_locked" not in st.session_state:
-    st.session_state.chat_locked = False  # Bug 2: lock chat after recommendation
+    st.session_state.chat_locked = False
 
 
 # ── LLM init ───────────────────────────────────────────────────────────────────
+@st.cache_resource
+def _load_llm(api_key: str, bls_path: str):
+    """Cached at module level — BLS file (5.8MB) loads once, not per session."""
+    return LLMInterface(api_key=api_key, bls_path=bls_path)
+
+
 def initialize_llm():
     try:
-        import os as _os
-        _app_dir  = _os.path.dirname(_os.path.abspath(__file__))
-        _bls_path = _os.path.join(_app_dir, "bls_ooh_chunks.jsonl")
-        st.session_state.llm = LLMInterface(api_key=GOOGLE_API_KEY, bls_path=_bls_path)
+        _app_dir  = os.path.dirname(os.path.abspath(__file__))
+        _bls_path = os.path.join(_app_dir, "bls_ooh_chunks.jsonl")
+        st.session_state.llm = _load_llm(GROQ_API_KEY, _bls_path)
         return True
     except Exception as e:
         st.session_state.llm_error = str(e)
         return False
 
 
-# ── Conversation-complete: ONLY when chat_locked ───────────────────────────────
+# ── Conversation-complete: only when chat_locked ───────────────────────────────
 def is_conversation_complete() -> bool:
-    """
-    Council button shows only when chat_locked=True.
-    chat_locked is set in process_message() when the LLM sends
-    a conclusion containing "Council of Experts".
-    Removed field-count fallback — it was showing the button too early.
-    """
+    """Council button shows only when chat_locked=True."""
     return st.session_state.get("chat_locked", False)
 
 
@@ -77,7 +77,7 @@ def render_header():
     """, unsafe_allow_html=True)
 
 
-# ── Bug 4 fix: sidebar counts ALL categories ───────────────────────────────────
+# ── Sidebar state panel ────────────────────────────────────────────────────────
 def render_sidebar_state():
     state_dict = st.session_state.state.to_dict()
 
@@ -137,15 +137,20 @@ def render_sidebar_state():
     )
     st.markdown(f"**Known facts:** {known_count}")
 
+    # Progress toward Council (soft target: ~12 meaningful facts)
+    TARGET_FACTS = 12
+    progress = min(known_count / TARGET_FACTS, 1.0)
+    st.progress(progress, text=f"Context: {min(int(progress*100), 100)}% — council unlocks when complete")
+
     # Per-category breakdown
     with st.expander("Fact breakdown", expanded=True):
-        subtype = state_dict.get("decision_metadata", {}).get("decision_subtype", "general")
-        options = state_dict.get("decision_metadata", {}).get("options_being_compared", ["Offer 1", "Offer 2"])
+        subtype  = state_dict.get("decision_metadata", {}).get("decision_subtype", "general")
+        opt_list = state_dict.get("decision_metadata", {}).get("options_being_compared", ["Offer 1", "Offer 2"])
 
         if subtype == "offer_comparison":
             categories = [
-                (f"{options[0] if options else 'Offer 1'} details", "offer_a"),
-                (f"{options[1] if len(options)>1 else 'Offer 2'} details", "offer_b"),
+                (f"{opt_list[0] if opt_list else 'Offer 1'} details", "offer_a"),
+                (f"{opt_list[1] if len(opt_list)>1 else 'Offer 2'} details", "offer_b"),
                 ("Values", "values"),
                 ("Decision metadata", "decision_metadata"),
             ]
@@ -629,15 +634,15 @@ def render_decision_tree(state_dict: dict, council_results: dict):
                     api_factors = _api_university_factors(ca, cb, opt_a, opt_b)
                     if api_factors:
                         factors = api_factors + factors
-                        print(f"[TREE] Injected {len(api_factors)} scorecard factors")
+                        logging.info(f"[TREE] Injected {len(api_factors)} scorecard factors")
                     else:
-                        print(f"[TREE] Scorecard cards found but no comparable fields")
+                        logging.info("[TREE] Scorecard cards found but no comparable fields")
                 else:
-                    print(f"[TREE] Scorecard: no match for '{opt_a}' or '{opt_b}'")
+                    logging.info(f"[TREE] Scorecard: no match for {opt_a!r} or {opt_b!r}")
             else:
-                print("[TREE] College retriever not initialised")
+                logging.warning("[TREE] College retriever not initialised")
         except Exception as e:
-            print(f"[TREE] College Scorecard error: {type(e).__name__}: {e}")
+            logging.error(f"[TREE] College Scorecard error: {type(e).__name__}: {e}")
 
     else:
         # Generic factor list for non-university decisions
@@ -683,9 +688,6 @@ def render_decision_tree(state_dict: dict, council_results: dict):
             "personal":"Personal Context","financial":"Financial",
             "offer_a": opt_a,"offer_b": opt_b,
         }
-
-        # Import impact_label inline (avoid circular ref)
-        from app import render_decision_tree  # self-ref hack not needed — define inline
 
         def _impact(field, val, subtype_):
             val_str = str(val).lower()
@@ -903,7 +905,7 @@ def render_council_perspectives():
         meta          = st.session_state.state.decision_metadata
         decision_type = meta.get("decision_type", "unknown")
         options       = meta.get("options_being_compared", [])
-        print(f"[COUNCIL] Type: {decision_type}, Options: {options}")
+        logging.info(f"[COUNCIL] Type: {decision_type}, Options: {options}")
 
         if len(options) >= 2:
             option_a, option_b = options[0], options[1]
@@ -1110,10 +1112,9 @@ def render_council_perspectives():
                 st.rerun()
 
     except Exception as e:
-        st.error(f"Error generating council perspectives: {str(e)}")
-        print(f"[COUNCIL] ERROR: {e}")
         import traceback
-        traceback.print_exc()
+        logging.error(traceback.format_exc())
+        st.error("The council ran into a problem — try again or start a new decision.")
         col_back, col_new = st.columns(2)
         with col_back:
             if st.button("Back to Chat"):
@@ -1135,7 +1136,7 @@ def process_message(user_message: str):
         st.error("Please ensure system is initialized")
         return
 
-    print(f"\n=== PROCESSING MESSAGE: {user_message[:60]} ===")
+    logging.info(f"Processing message: {user_message[:60]}")
 
     try:
         # Step 1: extract constraints
@@ -1143,21 +1144,15 @@ def process_message(user_message: str):
             user_message,
             st.session_state.state.to_dict()
         )
-        print(f"Extracted: {json.dumps(extracted, indent=2)}")
 
         # Step 2: update symbolic state
         if extracted.get("extracted"):
             for category, updates in extracted["extracted"].items():
                 if hasattr(st.session_state.state, category):
                     for key, value in updates.items():
-                        print(f"  {category}.{key} = {value}")
                         st.session_state.state.update(category, key, value)
                 else:
-                    print(f"  WARNING: unknown category '{category}'")
-
-        state_dict = st.session_state.state.to_dict()
-        print(f"  decision_metadata: {state_dict.get('decision_metadata', {})}")
-        print(f"  interests: {state_dict.get('interests', {})}")
+                    logging.warning(f"Unknown category from extraction: '{category}'")
 
         # Step 3: generate response
         response = st.session_state.llm.generate_response(
@@ -1166,25 +1161,28 @@ def process_message(user_message: str):
             mode="conversational"
         )
 
+        # Guard against rate-limit error passthrough
+        if response.strip().lower().startswith("i encountered an error"):
+            st.warning("The AI ran into a temporary issue — please try again in a moment.")
+            return
+
         st.session_state.messages.append({"role": "user", "content": user_message})
         st.session_state.messages.append({"role": "assistant", "content": response})
 
-        # Bug 2: lock chat if this is a conclusion response
+        # Lock chat when the LLM signals conclusion
         conclusion_phrases = [
             "Council of Experts", "council of experts",
             "'Council of Experts' button", "See Council",
         ]
         if any(phrase in response for phrase in conclusion_phrases):
             st.session_state.chat_locked = True
-            print("[APP] Chat locked — conclusion reached")
-
-        print("=== DONE ===\n")
 
     except Exception as e:
-        print(f"ERROR: {e}")
         import traceback
-        traceback.print_exc()
-        st.error(f"An error occurred: {str(e)}")
+        logging.error(traceback.format_exc())
+        st.error("Something went wrong processing your message. Please try again.")
+        if st.secrets.get("DEBUG", False):
+            st.exception(e)
 
 
 # ── Chat view ──────────────────────────────────────────────────────────────────
@@ -1193,13 +1191,15 @@ def render_chat():
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # Bug 2: locked vs active input
     if st.session_state.chat_locked:
         st.info(
             "I have enough information. Click **'See Council of Experts'** above "
             "to get the full multi-perspective analysis.",
             icon="💡"
         )
+        if st.button("↩ Actually, I want to add more context", use_container_width=False):
+            st.session_state.chat_locked = False
+            st.rerun()
     else:
         if prompt := st.chat_input("What decision are you working through?"):
             process_message(prompt)
@@ -1218,12 +1218,16 @@ def main():
                 if initialize_llm():
                     st.success("Ready")
                 else:
-                    st.error("System error")
+                    st.error("System initialization failed")
                     if "llm_error" in st.session_state:
                         st.code(st.session_state.llm_error)
         else:
             st.success("System Ready")
             st.caption("Using Llama 3.3 70B · Groq")
+            # Warn if College Scorecard is on demo key (rate-limited)
+            college_key = os.getenv("COLLEGE_SCORECARD_API_KEY", "")
+            if not college_key:
+                st.caption("⚠️ College data on demo key (40 req/hr) — set COLLEGE_SCORECARD_API_KEY for full access")
 
         st.markdown("---")
         render_sidebar_state()
