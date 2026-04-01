@@ -133,8 +133,7 @@ NAME_ALIASES: Dict[str, str] = {
     "sdsu":              "San Diego State University",
 
     # Missouri / Midwest
-    "ucm":               "Central Missouri",   # Scorecard uses shorter fragment
-    "university of central missouri": "Central Missouri",
+    "ucm":                         "University of Central Missouri",
     "university of central missouri": "University of Central Missouri",
     "mst":               "Missouri University of Science and Technology",
     "missouri s&t":      "Missouri University of Science and Technology",
