@@ -21,6 +21,7 @@ Public API
 """
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -222,7 +223,30 @@ class BLSRetriever:
         self.threshold = similarity_threshold
         self._occupations: Dict[str, Dict] = {}   # title → {meta, sections}
         self._titles_lower: List[Tuple[str, str]] = []  # (lower_title, original_title)
+        self._embedder = None          # lazy-loaded sentence-transformer
+        self._title_embeddings = None  # np.ndarray once embedder is ready
         self._load(jsonl_path)
+        self._try_load_embedder()
+
+    def _try_load_embedder(self) -> None:
+        """
+        Attempt to load a sentence-transformer model for embedding-based retrieval.
+        Falls back silently to difflib if the package is not installed.
+        The model (all-MiniLM-L6-v2) is ~80 MB and loads once at startup.
+        """
+        try:
+            from sentence_transformers import SentenceTransformer
+            import numpy as np
+            model = SentenceTransformer("all-MiniLM-L6-v2")
+            titles = [t for _, t in self._titles_lower]
+            self._title_embeddings = model.encode(titles, show_progress_bar=False)
+            self._embedder = model
+            self._embed_titles = titles
+            logging.info(f"[BLS] Sentence-transformer loaded — {len(titles)} title embeddings ready")
+        except ImportError:
+            logging.info("[BLS] sentence-transformers not installed — using difflib fallback")
+        except Exception as e:
+            logging.warning(f"[BLS] Embedder load failed ({e}) — using difflib fallback")
 
     def _load(self, path: str) -> None:
         with open(path, "r", encoding="utf-8") as f:
@@ -281,6 +305,33 @@ class BLSRetriever:
         if overlap:
             base = max(base, 0.4 + 0.1 * overlap)
         return base
+
+    def _embedding_search(self, query: str) -> Optional[str]:
+        """
+        Use sentence-transformer cosine similarity to find the best occupation
+        title for a free-form query.  Returns the matched title or None.
+        Only invoked when the difflib path returns no match above threshold.
+        """
+        if self._embedder is None or self._title_embeddings is None:
+            return None
+        try:
+            import numpy as np
+            q_emb = self._embedder.encode([query], show_progress_bar=False)
+            # Cosine similarity
+            norms_t = self._title_embeddings / (
+                np.linalg.norm(self._title_embeddings, axis=1, keepdims=True) + 1e-10
+            )
+            norms_q = q_emb / (np.linalg.norm(q_emb) + 1e-10)
+            sims    = norms_t @ norms_q.T
+            best_idx = int(np.argmax(sims))
+            best_sim = float(sims[best_idx])
+            if best_sim >= 0.35:
+                matched = self._embed_titles[best_idx]
+                logging.info(f"[BLS][EMBED] query={query!r} → {matched!r} (sim={best_sim:.2f})")
+                return matched
+        except Exception as e:
+            logging.warning(f"[BLS][EMBED] Error: {e}")
+        return None
 
     # ── Card construction ─────────────────────────────────────────────────────
 
@@ -364,6 +415,10 @@ class BLSRetriever:
                 best_title = original_title
 
         if best_score < self.threshold or best_title is None:
+            # Difflib failed — try embedding-based fallback
+            embed_title = self._embedding_search(query)
+            if embed_title:
+                return self._build_card(embed_title, 0.5, query)
             return None
 
         return self._build_card(best_title, best_score, query)
