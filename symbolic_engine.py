@@ -678,6 +678,468 @@ def _build_rule_registry() -> List[Rule]:
         ) == "job_vs_business",
     ))
 
+    # ── R016  Cost-of-Living Salary Illusion ─────────────────────────────────
+    R.append(Rule(
+        rule_id="R016",
+        name="Cost-of-Living Salary Illusion",
+        severity="warning",
+        agent_lens="financial",
+        provenance_fields=[
+            ("offer_a", "salary"),
+            ("offer_a", "city"),
+            ("offer_b", "salary"),
+            ("offer_b", "city"),
+        ],
+        condition=lambda s: (
+            bool(_get(s, "offer_a", "salary")) and
+            bool(_get(s, "offer_b", "salary")) and
+            bool(_get(s, "offer_a", "city")) and
+            bool(_get(s, "offer_b", "city")) and
+            _get(s, "offer_a", "city", "").lower() != _get(s, "offer_b", "city", "").lower() and
+            abs(float(_get(s, "offer_a", "salary") or 0) - float(_get(s, "offer_b", "salary") or 0)) < 20000
+        ),
+        explanation_template=(
+            "Offers ({offer_a.salary} in {offer_a.city}) vs ({offer_b.salary} in {offer_b.city}) "
+            "are in different cities — nominal salary comparison ignores cost-of-living differences "
+            "that can swing real purchasing power by 20–40%"
+        ),
+        precondition_descriptions=[
+            "offer_a.salary IS NOT NULL",
+            "offer_b.salary IS NOT NULL",
+            "offer_a.city ≠ offer_b.city",
+            "|offer_a.salary - offer_b.salary| < 20,000",
+        ],
+        applies_when=lambda s: _get(
+            s, "decision_metadata", "decision_subtype"
+        ) == "offer_comparison",
+    ))
+
+    # ── R017  Non-Compete Risk ────────────────────────────────────────────────
+    R.append(Rule(
+        rule_id="R017",
+        name="Non-Compete Agreement Risk",
+        severity="critical",
+        agent_lens="financial",
+        provenance_fields=[
+            ("legal", "non_compete"),
+        ],
+        condition=lambda s: (
+            _get(s, "legal", "non_compete") is True
+        ),
+        explanation_template=(
+            "legal.non_compete = True — a non-compete clause may legally bar this career "
+            "move or expose the person to litigation; this is a hard legal constraint, "
+            "not a preference"
+        ),
+        precondition_descriptions=[
+            "legal.non_compete = True",
+        ],
+        applies_when=lambda s: _get(
+            s, "decision_metadata", "decision_subtype"
+        ) in ("offer_comparison", "job_vs_business"),
+    ))
+
+    # ── R018  Health Insurance Gap with Dependents ────────────────────────────
+    R.append(Rule(
+        rule_id="R018",
+        name="Health Insurance Gap with Dependents",
+        severity="critical",
+        agent_lens="financial",
+        provenance_fields=[
+            ("legal", "health_insurance_needed"),
+            ("personal", "has_dependents"),
+        ],
+        condition=lambda s: (
+            _get(s, "legal", "health_insurance_needed") is True and
+            _get(s, "personal", "has_dependents") is True
+        ),
+        explanation_template=(
+            "health_insurance_needed = True with dependents — any gap in employer "
+            "health coverage directly affects the household; this is a non-negotiable "
+            "cost that must be factored into the financial comparison"
+        ),
+        precondition_descriptions=[
+            "legal.health_insurance_needed = True",
+            "personal.has_dependents = True",
+        ],
+    ))
+
+    # ── R019  Student Debt + Low-Income Career Path ───────────────────────────
+    R.append(Rule(
+        rule_id="R019",
+        name="Student Debt vs. Low-Income Career Path",
+        severity="warning",
+        agent_lens="financial",
+        provenance_fields=[
+            ("financial", "debt_total"),
+            ("financial", "expected_salary"),
+        ],
+        condition=lambda s: (
+            bool(_get(s, "financial", "debt_total")) and
+            _get(s, "financial", "debt_total") > 0 and
+            bool(_get(s, "financial", "expected_salary")) and
+            _get(s, "financial", "expected_salary") < 50000 and
+            _get(s, "financial", "debt_total") > _get(s, "financial", "expected_salary")
+        ),
+        explanation_template=(
+            "Student debt ({financial.debt_total}) exceeds expected annual salary "
+            "({financial.expected_salary}) — debt-to-income ratio above 1.0 at career start "
+            "is a significant financial stress indicator"
+        ),
+        precondition_descriptions=[
+            "financial.debt_total > 0",
+            "financial.expected_salary < 50,000",
+            "financial.debt_total > financial.expected_salary",
+        ],
+        applies_when=lambda s: _get(
+            s, "decision_metadata", "decision_type"
+        ) in ("career_choice", "education"),
+    ))
+
+    # ── R020  Remote Work Preference Mismatch ─────────────────────────────────
+    R.append(Rule(
+        rule_id="R020",
+        name="Remote Work Preference Mismatch",
+        severity="warning",
+        agent_lens="wellbeing",
+        provenance_fields=[
+            ("values", "work_life_balance"),
+            ("offer_a", "work_location"),
+            ("offer_b", "work_location"),
+        ],
+        condition=lambda s: (
+            bool(_get(s, "values", "work_life_balance")) and
+            _get(s, "values", "work_life_balance") >= 8 and
+            (
+                (
+                    bool(_get(s, "offer_a", "work_location")) and
+                    _get(s, "offer_a", "work_location", "").lower() == "onsite"
+                ) or
+                (
+                    bool(_get(s, "offer_b", "work_location")) and
+                    _get(s, "offer_b", "work_location", "").lower() == "onsite"
+                )
+            )
+        ),
+        explanation_template=(
+            "WLB priority = {values.work_life_balance}/10, yet one or more offers are "
+            "fully onsite — commute and schedule rigidity are documented WLB stressors; "
+            "this tradeoff is not captured in salary numbers alone"
+        ),
+        precondition_descriptions=[
+            "values.work_life_balance ≥ 8",
+            "offer_a.work_location = 'onsite' OR offer_b.work_location = 'onsite'",
+        ],
+        applies_when=lambda s: _get(
+            s, "decision_metadata", "decision_subtype"
+        ) == "offer_comparison",
+    ))
+
+    # ── R021  High Financial Priority + Startup + No Security Data ───────────
+    R.append(Rule(
+        rule_id="R021",
+        name="Financial Security Priority vs. Startup Risk",
+        severity="warning",
+        agent_lens="financial",
+        provenance_fields=[
+            ("values", "financial_security"),
+            ("offer_a", "job_security"),
+            ("offer_b", "job_security"),
+        ],
+        condition=lambda s: (
+            bool(_get(s, "values", "financial_security")) and
+            _get(s, "values", "financial_security") >= 8 and
+            (
+                _get(s, "offer_a", "job_security", "").lower() == "low" or
+                _get(s, "offer_b", "job_security", "").lower() == "low"
+            )
+        ),
+        explanation_template=(
+            "Financial security priority = {values.financial_security}/10, yet at least "
+            "one offer has low job_security — startups have a median 5-year survival rate "
+            "under 50%; this directly conflicts with the stated financial priority"
+        ),
+        precondition_descriptions=[
+            "values.financial_security ≥ 8",
+            "offer_a.job_security = 'low' OR offer_b.job_security = 'low'",
+        ],
+        applies_when=lambda s: _get(
+            s, "decision_metadata", "decision_subtype"
+        ) == "offer_comparison",
+    ))
+
+    # ── R022  Salary Regression Warning ──────────────────────────────────────
+    R.append(Rule(
+        rule_id="R022",
+        name="Salary Regression at New Opportunity",
+        severity="warning",
+        agent_lens="financial",
+        provenance_fields=[
+            ("financial", "current_income"),
+            ("financial", "new_opportunity_income"),
+        ],
+        condition=lambda s: (
+            bool(_get(s, "financial", "current_income")) and
+            bool(_get(s, "financial", "new_opportunity_income")) and
+            _get(s, "financial", "new_opportunity_income") <
+            0.9 * _get(s, "financial", "current_income")
+        ),
+        explanation_template=(
+            "New opportunity income ({financial.new_opportunity_income}) is more than 10% "
+            "below current income ({financial.current_income}) — "
+            "salary regression compounds debt and runway risk"
+        ),
+        precondition_descriptions=[
+            "financial.current_income IS NOT NULL",
+            "financial.new_opportunity_income IS NOT NULL",
+            "new_opportunity_income < 0.9 × current_income",
+        ],
+    ))
+
+    # ── R023  Sole Earner + High-Risk Transition ──────────────────────────────
+    R.append(Rule(
+        rule_id="R023",
+        name="Sole Earner with High-Risk Transition",
+        severity="critical",
+        agent_lens="financial",
+        provenance_fields=[
+            ("personal", "has_dependents"),
+            ("personal", "partner_employed"),
+            ("financial", "financial_runway_months"),
+        ],
+        condition=lambda s: (
+            _get(s, "personal", "has_dependents") is True and
+            _get(s, "personal", "partner_employed") is not True and
+            bool(_get(s, "financial", "financial_runway_months")) and
+            _get(s, "financial", "financial_runway_months") < 6 and
+            _get(s, "decision_metadata", "decision_subtype") == "offer_comparison"
+        ),
+        explanation_template=(
+            "Sole earner (partner_employed != True) with dependents and only "
+            "{financial.financial_runway_months} months runway — "
+            "any gap between jobs represents immediate household income risk"
+        ),
+        precondition_descriptions=[
+            "personal.has_dependents = True",
+            "personal.partner_employed != True",
+            "financial.financial_runway_months < 6",
+            "decision_subtype = offer_comparison",
+        ],
+        applies_when=lambda s: _get(
+            s, "decision_metadata", "decision_subtype"
+        ) == "offer_comparison",
+    ))
+
+    # ── R024  PhD Funding Unknown ─────────────────────────────────────────────
+    R.append(Rule(
+        rule_id="R024",
+        name="PhD Path Without Confirmed Funding",
+        severity="warning",
+        agent_lens="financial",
+        provenance_fields=[
+            ("career_vision", "post_graduation_goal"),
+            ("financial", "taking_student_debt"),
+            ("uni_a", "scholarship"),
+            ("uni_b", "scholarship"),
+        ],
+        condition=lambda s: (
+            _get(s, "career_vision", "post_graduation_goal") == "phd" and
+            _get(s, "financial", "taking_student_debt") is True and
+            _get(s, "uni_a", "scholarship") in (None, "none", "") and
+            _get(s, "uni_b", "scholarship") in (None, "none", "")
+        ),
+        explanation_template=(
+            "PhD path selected + taking_student_debt = True + no scholarship confirmed — "
+            "unfunded PhD programs leave graduates with high debt and stipend-level income "
+            "for 4–6 years; funded programs should be a hard filter, not a preference"
+        ),
+        precondition_descriptions=[
+            "career_vision.post_graduation_goal = 'phd'",
+            "financial.taking_student_debt = True",
+            "uni_a.scholarship IS NULL/none AND uni_b.scholarship IS NULL/none",
+        ],
+        applies_when=lambda s: _get(
+            s, "decision_metadata", "decision_type"
+        ) == "education",
+    ))
+
+    # ── R025  Early Career + Pure Salary Optimisation ────────────────────────
+    R.append(Rule(
+        rule_id="R025",
+        name="Early Career Over-Indexing on Salary",
+        severity="info",
+        agent_lens="growth",
+        provenance_fields=[
+            ("values", "financial_security"),
+            ("values", "career_growth"),
+            ("current", "current_year"),
+        ],
+        condition=lambda s: (
+            bool(_get(s, "values", "financial_security")) and
+            bool(_get(s, "values", "career_growth")) and
+            _get(s, "values", "financial_security") >= 9 and
+            _get(s, "values", "career_growth") <= 5 and
+            str(_get(s, "current", "current_year", "")).lower()
+            in ("freshman", "sophomore", "pre-college", "junior", "recent graduate")
+        ),
+        explanation_template=(
+            "Early career stage ({current.current_year}) + financial_security = "
+            "{values.financial_security}/10 >> career_growth = {values.career_growth}/10 — "
+            "salary optimisation at career start often trades long-term compounding for "
+            "short-term comfort; skill premium diverges significantly after 5–10 years"
+        ),
+        precondition_descriptions=[
+            "values.financial_security ≥ 9",
+            "values.career_growth ≤ 5",
+            "current.current_year ∈ {freshman, sophomore, pre-college, junior, recent graduate}",
+        ],
+        applies_when=lambda s: _get(
+            s, "decision_metadata", "decision_type"
+        ) in ("career_choice", "education"),
+    ))
+
+    # ── R026  Culture Unverified for High-Culture-Priority Person ─────────────
+    R.append(Rule(
+        rule_id="R026",
+        name="Culture Fit Unverified for Preferred Offer",
+        severity="warning",
+        agent_lens="wellbeing",
+        provenance_fields=[
+            ("values", "work_life_balance"),
+            ("offer_a", "culture"),
+            ("offer_b", "culture"),
+        ],
+        condition=lambda s: (
+            bool(_get(s, "values", "work_life_balance")) and
+            _get(s, "values", "work_life_balance") >= 8 and
+            not _get(s, "offer_a", "culture") and
+            not _get(s, "offer_b", "culture")
+        ),
+        explanation_template=(
+            "WLB priority = {values.work_life_balance}/10, but team culture is unknown "
+            "for both offers — culture is the single largest predictor of sustainable "
+            "work-life balance; this gap cannot be resolved from salary data"
+        ),
+        precondition_descriptions=[
+            "values.work_life_balance ≥ 8",
+            "offer_a.culture IS NULL",
+            "offer_b.culture IS NULL",
+        ],
+        applies_when=lambda s: _get(
+            s, "decision_metadata", "decision_subtype"
+        ) == "offer_comparison",
+    ))
+
+    # ── R027  Contractual Obligation Risk ─────────────────────────────────────
+    R.append(Rule(
+        rule_id="R027",
+        name="Unresolved Contractual Obligation",
+        severity="critical",
+        agent_lens="financial",
+        provenance_fields=[
+            ("legal", "contractual_obligations"),
+        ],
+        condition=lambda s: (
+            bool(_get(s, "legal", "contractual_obligations"))
+        ),
+        explanation_template=(
+            "legal.contractual_obligations = {legal.contractual_obligations} — "
+            "unresolved contractual obligations (clawbacks, vesting, garden leave) "
+            "can make the switch financially negative regardless of new offer terms"
+        ),
+        precondition_descriptions=[
+            "legal.contractual_obligations IS NOT NULL",
+        ],
+    ))
+
+    # ── R028  Impact Priority with Neither Option Scaled ──────────────────────
+    R.append(Rule(
+        rule_id="R028",
+        name="High Impact Priority with Unverified Impact Paths",
+        severity="info",
+        agent_lens="wellbeing",
+        provenance_fields=[
+            ("values", "impact"),
+            ("offer_a", "growth_potential"),
+            ("offer_b", "growth_potential"),
+        ],
+        condition=lambda s: (
+            bool(_get(s, "values", "impact")) and
+            _get(s, "values", "impact") >= 8 and
+            not _get(s, "offer_a", "growth_potential") and
+            not _get(s, "offer_b", "growth_potential")
+        ),
+        explanation_template=(
+            "values.impact = {values.impact}/10, but growth_potential is unknown for "
+            "both offers — impact compounds through career leverage; choosing blindly "
+            "on this priority risks a high-paying but low-leverage role"
+        ),
+        precondition_descriptions=[
+            "values.impact ≥ 8",
+            "offer_a.growth_potential IS NULL",
+            "offer_b.growth_potential IS NULL",
+        ],
+        applies_when=lambda s: _get(
+            s, "decision_metadata", "decision_subtype"
+        ) == "offer_comparison",
+    ))
+
+    # ── R029  Passion Exit Without Side Income Validation ────────────────────
+    R.append(Rule(
+        rule_id="R029",
+        name="Passion Exit Without Any Revenue Validation",
+        severity="warning",
+        agent_lens="financial",
+        provenance_fields=[
+            ("current", "business_validated"),
+            ("current", "business_idea"),
+        ],
+        condition=lambda s: (
+            bool(_get(s, "current", "business_idea")) and
+            _get(s, "current", "business_validated") is not True
+        ),
+        explanation_template=(
+            "business_idea present but business_validated != True — "
+            "transitioning to an unvalidated concept without revenue evidence "
+            "is hypothesis-driven, not market-driven; validation before full exit "
+            "dramatically reduces failure risk"
+        ),
+        precondition_descriptions=[
+            "current.business_idea IS NOT NULL",
+            "current.business_validated ≠ True",
+        ],
+        applies_when=lambda s: _get(
+            s, "decision_metadata", "decision_subtype"
+        ) == "job_vs_business",
+    ))
+
+    # ── R030  High Dissatisfaction — Cost of Staying ─────────────────────────
+    R.append(Rule(
+        rule_id="R030",
+        name="High Dissatisfaction — Status Quo Has a Cost",
+        severity="info",
+        agent_lens="wellbeing",
+        provenance_fields=[
+            ("current", "current_satisfaction"),
+            ("current", "leave_reason"),
+        ],
+        condition=lambda s: (
+            bool(_get(s, "current", "current_satisfaction")) and
+            isinstance(_get(s, "current", "current_satisfaction"), (int, float)) and
+            _get(s, "current", "current_satisfaction") <= 3 and
+            bool(_get(s, "current", "leave_reason"))
+        ),
+        explanation_template=(
+            "current_satisfaction = {current.current_satisfaction}/10 — "
+            "sustained low satisfaction has documented health and productivity costs; "
+            "staying is not a neutral choice; the cost of inaction is real"
+        ),
+        precondition_descriptions=[
+            "current.current_satisfaction ≤ 3",
+            "current.leave_reason IS NOT NULL",
+        ],
+    ))
+
     return R
 
 
@@ -1630,10 +2092,56 @@ class DecisionState:
         return mode
 
     def get_missing_critical_info(self) -> List[str]:
-        """Unchanged from original."""
-        missing       = []
-        decision_type = self.decision_metadata.get("decision_type")
-        if decision_type in ("career_choice", "education"):
+        """
+        Return a list of critical facts still missing for a meaningful analysis.
+
+        Each decision subtype requires a different set of facts — using a single
+        binary split (career_choice vs else) was incorrect and produced misleading
+        missing-info indicators for university_comparison and job_vs_business.
+        """
+        missing          = []
+        decision_type    = self.decision_metadata.get("decision_type")
+        decision_subtype = self.decision_metadata.get("decision_subtype", "general")
+
+        if decision_subtype in ("major_choice", "education_path"):
+            # Need to know interests and career direction
+            interests_known = sum(
+                1 for v in self.interests.values() if v is not None
+            )
+            if interests_known == 0:
+                missing.append("What kind of work or study they enjoy")
+            if not self.career_vision.get("desired_role_5yr"):
+                missing.append("Career vision / desired role in 5 years")
+
+        elif decision_subtype == "offer_comparison":
+            # Need at least one salary data point to compare
+            sal_a = self.offer_a.get("salary")
+            sal_b = self.offer_b.get("salary")
+            if sal_a is None and sal_b is None:
+                missing.append("Salary or compensation details for at least one offer")
+            if not self.values.get("financial_security") and not self.values.get("career_growth"):
+                missing.append("Personal priorities (financial security vs. career growth)")
+
+        elif decision_subtype == "university_comparison":
+            # Need cost awareness and career goal — NOT work-life balance of a job
+            if not self.financial.get("taking_student_debt") and \
+               not self.uni_a.get("tuition") and not self.uni_b.get("tuition"):
+                missing.append("Tuition cost or student debt situation")
+            if not self.career_vision.get("post_graduation_goal") and \
+               not self.career_vision.get("desired_role_5yr"):
+                missing.append("Post-graduation goal (job, PhD, etc.)")
+
+        elif decision_subtype == "job_vs_business":
+            # Need financial runway — that is the critical constraint
+            runway = self.financial.get("financial_runway_months")
+            runway_label = self.current.get("financial_runway")
+            if runway is None and not runway_label:
+                missing.append("Financial runway (how long they can sustain without income)")
+            if not self.current.get("business_idea"):
+                missing.append("Description of the business idea or passion pursuit")
+
+        elif decision_type == "career_choice":
+            # Generic career choice — interests and vision are the minimum
             interests_known = sum(
                 1 for v in self.interests.values() if v is not None
             )
@@ -1641,16 +2149,16 @@ class DecisionState:
                 missing.append("What kind of work they enjoy")
             if not self.career_vision.get("desired_role_5yr"):
                 missing.append("Career vision / desired role in 5 years")
+
         else:
-            if self.financial["current_savings"] is None:
-                missing.append("Current savings amount")
-            if self.financial["monthly_expenses"] is None:
-                missing.append("Monthly expenses")
-            if self.opportunity["company"]:
-                if not self.opportunity["work_life_balance_known"]:
+            # General / unknown decision type — check the classic job-change facts
+            # only if there is an explicit opportunity being evaluated
+            if self.opportunity.get("company"):
+                if not self.opportunity.get("work_life_balance_known"):
                     missing.append("Work-life balance at new opportunity")
-                if not self.opportunity["team_culture_known"]:
+                if not self.opportunity.get("team_culture_known"):
                     missing.append("Team culture and expectations")
+
         self.missing_critical_info = missing
         return missing
 
