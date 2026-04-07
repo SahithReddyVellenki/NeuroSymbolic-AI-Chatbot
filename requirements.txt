@@ -1,8 +1,9 @@
+
 streamlit>=1.35.0
 openai>=1.30.0           # Groq is OpenAI-compatible
 requests>=2.31.0
 python-dotenv>=1.0.0
 sentence-transformers>=2.7.0
 numpy>=1.24.0
-Pillow==10.0.0
-gtts
+gTTS>=2.3.2              # Natural-sounding TTS via Google's engine
+SpeechRecognition>=3.10.0  # Free Google speech-to-text (no API key needed)
